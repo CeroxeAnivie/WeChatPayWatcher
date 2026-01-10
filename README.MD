@@ -11,7 +11,7 @@
 由于本程序依赖屏幕截图 (`java.awt.Robot`)，**无法在无图形界面的 Linux (Headless) 上直接运行**。
 
 ### 1. 基础环境
-*   **JDK**: Java 17 或更高版本
+*   **JDK**: Java 21 或更高版本
 *   **OS**: Windows / Linux (带桌面环境 或 VNC) / macOS
 *   **依赖库**: Linux 下可能需要安装 `libgomp1` 和 `libgl1-mesa-glx` (OCR 引擎依赖)
 
