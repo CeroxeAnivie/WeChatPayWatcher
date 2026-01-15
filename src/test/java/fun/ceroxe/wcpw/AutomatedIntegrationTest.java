@@ -7,87 +7,124 @@ import okhttp3.*;
 import javax.net.ssl.*;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
-import java.util.Scanner;
+import java.util.*;
 
 public class AutomatedIntegrationTest {
 
-    // 目标地址 (确保端口和域名正确)
-    private static final String TARGET_URL = "https://p.ceroxe.fun:58080/";
+    // ================= 配置区域 =================
 
-    // 【新增】鉴权 Token (必须与服务端 config.properties 保持一致)
-    private static final String AUTH_TOKEN = "ceroxe-secret-8888";
+    // 目标地址 (WCPW 服务端地址)
+    private static final String TARGET_URL = "http://127.0.0.1:9090/";
 
-    // 回调配置 (本机监听端口 + 告诉服务端的公网回调地址)
-    private static final int LOCAL_CALLBACK_PORT = 9090;
-    // 注意：如果你是在本地跑测试，服务端在云端，服务端必须能访问到这个 IP
-    private static final String PUBLIC_CALLBACK_URL = "http://p.ceroxe.fun:47891/notify";
+    // 鉴权 Token (必须与服务端 config.properties [auth.token] 一致)
+    private static final String AUTH_TOKEN = "YOUR_API_ACCESS_TOKEN";
 
-    // 忽略 SSL 验证的 Client
+    // 签名密钥 (必须与服务端 config.properties [callback.secret] 一致)
+    private static final String CALLBACK_SECRET = "YOUR_SHARED_SECRET_KEY";
+
+    // 本机监听端口 (用于接收回调)
+    private static final int LOCAL_LISTEN_PORT = 47891;
+
+    // 告诉服务端的公网回调地址
+    // 注意：如果 WCPW 在云端，这里必须填你的公网 IP；如果在本地，填 http://127.0.0.1:端口
+    private static final String PUBLIC_CALLBACK_BASE = "http://p.ceroxe.fun:" + LOCAL_LISTEN_PORT + "/notify";
+
+    // ===========================================
+
     private static final OkHttpClient client = getUnsafeOkHttpClient();
     private static final Gson gson = new Gson();
 
     public static void main(String[] args) throws IOException, InterruptedException {
         System.out.println("==========================================");
-        System.out.println("   微信支付守卫 - 自动化集成测试 (Client)");
+        System.out.println("   微信支付守卫 - 全链路安全集成测试 (v2.0)");
         System.out.println("==========================================");
         System.out.println("目标服务: " + TARGET_URL);
-        System.out.println("回调地址: " + PUBLIC_CALLBACK_URL);
-        System.out.println("鉴权Token: " + AUTH_TOKEN);
+        System.out.println("本地监听: " + LOCAL_LISTEN_PORT);
         System.out.println("------------------------------------------");
 
-        // 1. 获取控制台输入
         Scanner scanner = new Scanner(System.in);
-        System.out.print(">>> 请输入要测试的金额 (例如 1.06): ");
+        System.out.print(">>> 请输入测试金额 (例如 0.01): ");
         double amount;
         try {
             amount = scanner.nextDouble();
         } catch (Exception e) {
-            System.err.println("输入无效，请输入数字！");
+            System.err.println("输入无效！");
             return;
         }
 
-        // 2. 启动本地回调监听
-        HttpServer callbackServer = HttpServer.create(new InetSocketAddress(LOCAL_CALLBACK_PORT), 0);
-        callbackServer.createContext("/notify", exchange -> {
-            String body = new String(exchange.getRequestBody().readAllBytes());
-            System.out.println("\n\n[⭐⭐ 测试通过] 收到服务端回调!");
-            System.out.println("内容: " + body);
+        // 生成一个测试用的订单号
+        String testOid = "TEST_" + System.currentTimeMillis();
+        // 构造带 oid 的回调地址 (WCPW 签名逻辑强依赖 oid)
+        String finalCallbackUrl = PUBLIC_CALLBACK_BASE + "?oid=" + testOid;
 
-            // 简单的响应
-            exchange.sendResponseHeaders(200, 2);
-            exchange.getResponseBody().write("OK".getBytes());
-            exchange.close();
+        // 1. 启动本地回调监听服务器
+        HttpServer callbackServer = HttpServer.create(new InetSocketAddress(LOCAL_LISTEN_PORT), 0);
+        callbackServer.createContext("/notify", exchange -> {
+            try {
+                String query = exchange.getRequestURI().getQuery();
+                String body = new String(exchange.getRequestBody().readAllBytes());
+
+                System.out.println("\n\n[📨 收到回调] ==============================");
+                System.out.println("URL Params: " + query);
+                System.out.println("Body JSON : " + body);
+
+                // 解析参数
+                Map<String, String> params = parseQueryParams(query);
+
+                // === 核心：执行本地验签 ===
+                System.out.println("------------------------------------------");
+                System.out.println("🔐 正在进行安全签名校验...");
+
+                if (verifySignature(params)) {
+                    System.out.println("✅ [校验通过] 签名匹配！服务端身份合法。");
+                    System.out.println("   服务端 Sign: " + params.get("sign"));
+                } else {
+                    System.err.println("❌ [校验失败] 签名不匹配！可能是伪造请求或密钥配置错误。");
+                    System.err.println("   服务端 Sign: " + params.get("sign"));
+                }
+                System.out.println("==========================================\n");
+
+                exchange.sendResponseHeaders(200, 0);
+                exchange.getResponseBody().write("{\"code\":200}".getBytes());
+            } catch (Exception e) {
+                e.printStackTrace();
+                exchange.sendResponseHeaders(500, 0);
+            } finally {
+                exchange.close();
+            }
         });
         callbackServer.start();
-        System.out.println(">>> 本地回调监听已启动 (Port: " + LOCAL_CALLBACK_PORT + ")");
+        System.out.println(">>> 本地监听已启动，等待回调...");
 
-        // 3. 发起支付请求
-        System.out.println(">>> 正在向服务端发送请求 (金额: " + amount + ")...");
-        sendPaymentRequest(amount);
+        // 2. 发送请求给 WCPW
+        System.out.println(">>> 正在发送监控请求 (OID: " + testOid + ")...");
+        sendPaymentRequest(amount, finalCallbackUrl);
 
-        // 4. 保持运行
-        System.out.println(">>> ⏳ 正在等待结果... (请在服务端触发识别，或等待超时)");
-        System.out.println(">>> (按 Ctrl+C 强制退出)");
+        // 3. 等待
+        System.out.println(">>> ⏳ 请现在手动触发微信收款 (金额: " + amount + ")");
+        System.out.println(">>> (程序将在 120秒 后超时退出)");
 
-        // 等待 70秒 (比服务端的 60秒超时稍长一点)
-        Thread.sleep(70000);
+        Thread.sleep(120000);
 
         callbackServer.stop(0);
-        System.out.println("\n>>> 测试结束 (超时未收到回调)");
+        System.out.println(">>> 测试结束 (超时)");
         System.exit(0);
     }
 
-    private static void sendPaymentRequest(double money) {
+    private static void sendPaymentRequest(double money, String callbackUrl) {
         new Thread(() -> {
             try {
-                // 【适配】构造请求 DTO (包含 token)
                 DTOs.PaymentRequest req = new DTOs.PaymentRequest(
                         AUTH_TOKEN,
                         money,
                         String.valueOf(System.currentTimeMillis()),
-                        PUBLIC_CALLBACK_URL
+                        callbackUrl
                 );
 
                 Request request = new Request.Builder()
@@ -96,21 +133,78 @@ public class AutomatedIntegrationTest {
                         .build();
 
                 try (Response response = client.newCall(request).execute()) {
-                    System.out.println("   --> 发送结果: HTTP " + response.code() + " " + response.message());
-                    if (response.isSuccessful() && response.body() != null) {
-                        System.out.println("   --> Server返回: " + response.body().string());
-                    } else if (response.body() != null) {
-                        System.err.println("   --> 错误详情: " + response.body().string());
+                    System.out.println("   --> 请求发送状态: " + response.code());
+                    if (response.body() != null) {
+                        System.out.println("   --> 响应: " + response.body().string());
                     }
                 }
             } catch (Exception e) {
-                System.err.println("   --> 请求发送失败: " + e.getMessage());
-                e.printStackTrace();
+                System.err.println("   --> 发送失败: " + e.getMessage());
             }
         }).start();
     }
 
-    // 核心：绕过 SSL 验证的黑科技方法 (用于自签名证书)
+    // ================== 验签工具方法 ==================
+
+    private static boolean verifySignature(Map<String, String> params) {
+        if (!params.containsKey("sign")) {
+            System.err.println("   [Error] 回调参数中缺少 sign 字段");
+            return false;
+        }
+
+        String incomingSign = params.get("sign");
+
+        // 1. 排除 sign 字段，其余字段按 ASCII 排序
+        Map<String, String> sortedParams = new TreeMap<>(params);
+        sortedParams.remove("sign");
+
+        // 2. 拼接 k=v&k=v...&key=SECRET
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> entry : sortedParams.entrySet()) {
+            if (entry.getValue() != null && !entry.getValue().isBlank()) {
+                sb.append(entry.getKey()).append("=").append(entry.getValue()).append("&");
+            }
+        }
+        sb.append("key=").append(CALLBACK_SECRET);
+
+        // 3. 计算 MD5
+        String calculatedSign = md5(sb.toString()).toUpperCase();
+
+        System.out.println("   [Debug] 本地计算签名串: " + sb);
+        System.out.println("   [Debug] 本地计算 Hash : " + calculatedSign);
+
+        return calculatedSign.equals(incomingSign);
+    }
+
+    private static String md5(String s) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] array = md.digest(s.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : array) {
+                sb.append(Integer.toHexString((b & 0xFF) | 0x100).substring(1, 3));
+            }
+            return sb.toString();
+        } catch (Exception e) { return ""; }
+    }
+
+    private static Map<String, String> parseQueryParams(String query) {
+        Map<String, String> map = new HashMap<>();
+        if (query == null || query.isEmpty()) return map;
+        for (String pair : query.split("&")) {
+            String[] kv = pair.split("=", 2);
+            if (kv.length == 2) {
+                // URL Decode
+                String key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
+                String val = URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
+                map.put(key, val);
+            }
+        }
+        return map;
+    }
+
+    // ================== SSL 绕过工具 ==================
+
     private static OkHttpClient getUnsafeOkHttpClient() {
         try {
             final TrustManager[] trustAllCerts = new TrustManager[]{
@@ -122,10 +216,9 @@ public class AutomatedIntegrationTest {
             };
             final SSLContext sslContext = SSLContext.getInstance("SSL");
             sslContext.init(null, trustAllCerts, new SecureRandom());
-
             return new OkHttpClient.Builder()
                     .sslSocketFactory(sslContext.getSocketFactory(), (X509TrustManager) trustAllCerts[0])
-                    .hostnameVerifier((hostname, session) -> true) // 允许所有域名
+                    .hostnameVerifier((hostname, session) -> true)
                     .build();
         } catch (Exception e) { throw new RuntimeException(e); }
     }

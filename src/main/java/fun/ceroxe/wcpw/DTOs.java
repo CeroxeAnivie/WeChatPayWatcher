@@ -1,7 +1,6 @@
 package fun.ceroxe.wcpw;
 
 public class DTOs {
-    // 【修改】增加了 token 字段
     public record PaymentRequest(
             String token,
             double money,

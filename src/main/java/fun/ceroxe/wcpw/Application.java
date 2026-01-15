@@ -57,10 +57,8 @@ public class Application {
     private static CallbackClient callbackClient;
 
     public static void main(String[] args) {
-        // 1. 初始化日志（降噪 + 文件输出）
         initLogging();
 
-        // 2. 环境配置 & 临时目录
         String currentDir = System.getProperty("user.dir");
         File tempDir = new File(currentDir, "ocr_native_libs");
         if (!tempDir.exists()) tempDir.mkdirs();
@@ -69,7 +67,6 @@ public class Application {
         Security.addProvider(new BouncyCastleProvider());
         AppConfig.init();
 
-        // 3. 启动引擎
         try {
             logger.info("⚙️ 正在启动 OCR 引擎...");
             monitorService = new WeChatMonitorService();
@@ -82,40 +79,27 @@ public class Application {
         startUndertowServer();
     }
 
-    /**
-     * 初始化日志系统
-     * 1. 屏蔽底层库日志
-     * 2. 配置日志输出到 logs 文件夹，以时间戳命名
-     */
     private static void initLogging() {
         LoggerContext loggerContext = (LoggerContext) LoggerFactory.getILoggerFactory();
-
-        // A. 降噪：屏蔽底层库的废话
         try {
             loggerContext.getLogger("io.github.mymonstercat").setLevel(Level.WARN);
             loggerContext.getLogger("com.benjaminwan.ocrlibrary").setLevel(Level.WARN);
             loggerContext.getLogger("io.undertow").setLevel(Level.INFO);
             loggerContext.getLogger("org.xnio").setLevel(Level.INFO);
-        } catch (Exception e) {
-            // 忽略
+        } catch (Exception ignored) {
         }
 
-        // B. 文件输出：自动写入 logs 文件夹
         try {
             File logDir = new File("logs");
             if (!logDir.exists()) logDir.mkdirs();
-
-            // 生成文件名: log_20260111_014000.log
             String timeStr = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss").format(LocalDateTime.now());
             String logFilePath = "logs" + File.separator + "log_" + timeStr + ".log";
 
-            // 定义日志格式
             PatternLayoutEncoder encoder = new PatternLayoutEncoder();
             encoder.setContext(loggerContext);
             encoder.setPattern("%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n");
             encoder.start();
 
-            // 创建文件 Appender
             FileAppender<ILoggingEvent> fileAppender = new FileAppender<>();
             fileAppender.setContext(loggerContext);
             fileAppender.setName("FILE_APPENDER");
@@ -123,13 +107,9 @@ public class Application {
             fileAppender.setEncoder(encoder);
             fileAppender.start();
 
-            // 添加到 Root Logger
             Logger rootLogger = loggerContext.getLogger(Logger.ROOT_LOGGER_NAME);
             rootLogger.addAppender(fileAppender);
-
-            // 使用 System.out 打印，确保这行一定能看到
             System.out.println("📄 日志文件已创建: " + logFilePath);
-
         } catch (Exception e) {
             System.err.println("❌ 初始化日志文件失败: " + e.getMessage());
         }
@@ -212,7 +192,8 @@ public class Application {
                 int timeoutSec = AppConfig.getInt("order.timeout.seconds");
                 currentTaskEndTime.set(System.currentTimeMillis() + (timeoutSec * 1000L));
 
-                String taskId = UUID.randomUUID().toString().substring(0, 8);
+                // 【优化】尝试从 callbackUrl 中提取 OID 作为 taskId，方便日志对账
+                String taskId = extractOid(req.callbackUrl());
                 logger.info("📥 [API] 接收任务 [{}] | 目标: ¥{} | 回调: {}", taskId, req.money(), req.callbackUrl());
 
                 monitorExecutor.submit(() -> runMonitorTask(taskId, req, timeoutSec));
@@ -231,11 +212,27 @@ public class Application {
         }
     }
 
+    // 辅助方法：提取OID
+    private static String extractOid(String url) {
+        try {
+            if (url.contains("oid=")) {
+                String[] parts = url.split("oid=");
+                if (parts.length > 1) {
+                    String oid = parts[1].split("&")[0];
+                    if (!oid.isBlank()) return oid;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return UUID.randomUUID().toString().substring(0, 8); // 提取失败则回退到 UUID
+    }
+
     private static void runMonitorTask(String taskId, DTOs.PaymentRequest req, int timeoutSec) {
         try {
             boolean success = monitorService.monitorPayment(taskId, req.money(), timeoutSec);
 
             String status = success ? "SUCCESS" : "TIMEOUT";
+            // Payload 依然保留，但 Sign 逻辑在 Client 里做
             DTOs.CallbackPayload payload = new DTOs.CallbackPayload(
                     status, req.timestamp(), System.currentTimeMillis(), req.money(), status
             );
