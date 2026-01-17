@@ -4,174 +4,186 @@ import com.google.gson.Gson;
 import com.sun.net.httpserver.HttpServer;
 import okhttp3.*;
 
-import javax.net.ssl.*;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
-import java.util.*;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.TreeMap;
 
+/**
+ * 微信支付全链条安全集成测试工具 (NAS 模拟器)
+ * 覆盖：预支付请求 -> 异步回调 -> 字段提取 -> 签名算法验证 -> JSON Payload 校验
+ */
 public class AutomatedIntegrationTest {
 
-    // ================= 配置区域 =================
+    // ================= 配置区域 (请根据实际环境修改) =================
 
-    // 目标地址 (WCPW 服务端地址)
-    private static final String TARGET_URL = "http://127.0.0.1:9090/";
+    // 1. WCPW 守卫服务的 API 地址
+    private static final String WCPW_API_URL = "http://127.0.0.1:9090/";
 
-    // 鉴权 Token (必须与服务端 config.properties [auth.token] 一致)
+    // 2. 鉴权 Token (对应 WCPW 的 auth.token)
     private static final String AUTH_TOKEN = "YOUR_API_ACCESS_TOKEN";
 
-    // 签名密钥 (必须与服务端 config.properties [callback.secret] 一致)
-    private static final String CALLBACK_SECRET = "YOUR_SHARED_SECRET_KEY";
+    // 3. 共享密钥 (对应 WCPW 的 callback.secret 和 NAS 的 wcpw.token)
+    private static final String SHARED_SECRET = "YOUR_SHARED_SECRET_KEY";
 
-    // 本机监听端口 (用于接收回调)
-    private static final int LOCAL_LISTEN_PORT = 47891;
+    // 4. 本机模拟监听端口
+    private static final int NAS_SIMULATOR_PORT = 47891;
 
-    // 告诉服务端的公网回调地址
-    // 注意：如果 WCPW 在云端，这里必须填你的公网 IP；如果在本地，填 http://127.0.0.1:端口
-    private static final String PUBLIC_CALLBACK_BASE = "http://p.ceroxe.fun:" + LOCAL_LISTEN_PORT + "/notify";
+    // 5. 模拟公网回调地址 (WCPW 成功后会访问这里)
+    private static final String CALLBACK_BASE_URL = "http://127.0.0.1:" + NAS_SIMULATOR_PORT + "/api/callback";
 
-    // ===========================================
+    // =============================================================
 
     private static final OkHttpClient client = getUnsafeOkHttpClient();
     private static final Gson gson = new Gson();
 
-    public static void main(String[] args) throws IOException, InterruptedException {
-        System.out.println("==========================================");
-        System.out.println("   微信支付守卫 - 全链路安全集成测试 (v2.0)");
-        System.out.println("==========================================");
-        System.out.println("目标服务: " + TARGET_URL);
-        System.out.println("本地监听: " + LOCAL_LISTEN_PORT);
+    public static void main(String[] args) throws IOException {
+        System.out.println("🚀 [NAS 模拟器] 全链条安全测试启动...");
         System.out.println("------------------------------------------");
 
         Scanner scanner = new Scanner(System.in);
-        System.out.print(">>> 请输入测试金额 (例如 0.01): ");
-        double amount;
-        try {
-            amount = scanner.nextDouble();
-        } catch (Exception e) {
-            System.err.println("输入无效！");
-            return;
-        }
+        System.out.print(">>> 输入模拟测试金额 (例 0.01): ");
+        double amount = scanner.nextDouble();
 
-        // 生成一个测试用的订单号
-        String testOid = "TEST_" + System.currentTimeMillis();
-        // 构造带 oid 的回调地址 (WCPW 签名逻辑强依赖 oid)
-        String finalCallbackUrl = PUBLIC_CALLBACK_BASE + "?oid=" + testOid;
+        String testOid = "NAS_TEST_" + System.currentTimeMillis();
+        // 按照 OrderService 逻辑构造初始回调地址
+        String finalCallbackUrl = CALLBACK_BASE_URL + "?oid=" + testOid;
 
-        // 1. 启动本地回调监听服务器
-        HttpServer callbackServer = HttpServer.create(new InetSocketAddress(LOCAL_LISTEN_PORT), 0);
-        callbackServer.createContext("/notify", exchange -> {
+        // 1. 启动本地回调服务器 (模拟 WebServer.java)
+        startNasSimulator(testOid);
+
+        // 2. 向 WCPW 发起监控请求 (模拟 OrderService.createOrder)
+        sendPaymentRequestToWcpw(testOid, amount, finalCallbackUrl);
+
+        System.out.println("\n>>> [等待中] 请在 120 秒内完成微信扫码支付 (金额: " + amount + ")");
+        System.out.println(">>> 测试程序运行中...");
+    }
+
+    private static void startNasSimulator(String expectedOid) throws IOException {
+        HttpServer server = HttpServer.create(new InetSocketAddress(NAS_SIMULATOR_PORT), 0);
+
+        server.createContext("/api/callback", exchange -> {
             try {
+                // 只接受 POST
+                if (!"POST".equals(exchange.getRequestMethod())) {
+                    exchange.sendResponseHeaders(405, -1);
+                    return;
+                }
+
+                // A. 提取并打印 URL 参数 (测试 WebServer 解析能力)
                 String query = exchange.getRequestURI().getQuery();
-                String body = new String(exchange.getRequestBody().readAllBytes());
-
-                System.out.println("\n\n[📨 收到回调] ==============================");
-                System.out.println("URL Params: " + query);
-                System.out.println("Body JSON : " + body);
-
-                // 解析参数
                 Map<String, String> params = parseQueryParams(query);
 
-                // === 核心：执行本地验签 ===
-                System.out.println("------------------------------------------");
-                System.out.println("🔐 正在进行安全签名校验...");
+                System.out.println("\n[📨 收到回调通知]");
+                System.out.println("   URL Query: " + query);
 
-                if (verifySignature(params)) {
-                    System.out.println("✅ [校验通过] 签名匹配！服务端身份合法。");
-                    System.out.println("   服务端 Sign: " + params.get("sign"));
+                // B. 提取 Body (测试 DTOs 兼容性)
+                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                DTOs.CallbackPayload payload = gson.fromJson(body, DTOs.CallbackPayload.class);
+                System.out.println("   Body JSON: " + body);
+
+                // C. 执行企业级验签 (同步 OrderService 逻辑)
+                System.out.println("------------------------------------------");
+                System.out.println("🔐 执行安全验签校验...");
+
+                boolean isSignValid = verifySignature(params);
+                boolean isOidValid = expectedOid.equals(params.get("oid")) && expectedOid.equals(payload.oid());
+
+                if (isSignValid && isOidValid) {
+                    System.out.println("✅ [测试通过] 签名合法，OID 链路匹配！");
+                    System.out.println("   订单状态: " + payload.status());
+                    System.out.println("   实收金额: " + payload.amount());
                 } else {
-                    System.err.println("❌ [校验失败] 签名不匹配！可能是伪造请求或密钥配置错误。");
-                    System.err.println("   服务端 Sign: " + params.get("sign"));
+                    System.err.println("❌ [测试失败] 校验不通过！");
+                    if (!isSignValid) System.err.println("   原因: 签名不匹配 (计算结果与收到结果不符)");
+                    if (!isOidValid) System.err.println("   原因: OID 链路丢失 (Expected: " + expectedOid + ")");
                 }
                 System.out.println("==========================================\n");
 
-                exchange.sendResponseHeaders(200, 0);
-                exchange.getResponseBody().write("{\"code\":200}".getBytes());
+                // 回复 WCPW
+                String response = "{\"code\":200,\"msg\":\"success\"}";
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, response.length());
+                exchange.getResponseBody().write(response.getBytes());
+
             } catch (Exception e) {
                 e.printStackTrace();
-                exchange.sendResponseHeaders(500, 0);
             } finally {
                 exchange.close();
             }
         });
-        callbackServer.start();
-        System.out.println(">>> 本地监听已启动，等待回调...");
 
-        // 2. 发送请求给 WCPW
-        System.out.println(">>> 正在发送监控请求 (OID: " + testOid + ")...");
-        sendPaymentRequest(amount, finalCallbackUrl);
-
-        // 3. 等待
-        System.out.println(">>> ⏳ 请现在手动触发微信收款 (金额: " + amount + ")");
-        System.out.println(">>> (程序将在 120秒 后超时退出)");
-
-        Thread.sleep(120000);
-
-        callbackServer.stop(0);
-        System.out.println(">>> 测试结束 (超时)");
-        System.exit(0);
+        server.setExecutor(null);
+        server.start();
+        System.out.println(">>> NAS 模拟服务器已在端口 " + NAS_SIMULATOR_PORT + " 就绪");
     }
 
-    private static void sendPaymentRequest(double money, String callbackUrl) {
-        new Thread(() -> {
-            try {
-                DTOs.PaymentRequest req = new DTOs.PaymentRequest(
-                        AUTH_TOKEN,
-                        money,
-                        String.valueOf(System.currentTimeMillis()),
-                        callbackUrl
-                );
+    private static void sendPaymentRequestToWcpw(String oid, double amount, String callback) {
+        DTOs.PaymentRequest req = new DTOs.PaymentRequest(
+                AUTH_TOKEN,
+                amount,
+                String.valueOf(System.currentTimeMillis()),
+                callback
+        );
 
-                Request request = new Request.Builder()
-                        .url(TARGET_URL)
-                        .post(RequestBody.create(gson.toJson(req), MediaType.get("application/json")))
-                        .build();
+        RequestBody body = RequestBody.create(gson.toJson(req), MediaType.get("application/json"));
+        Request request = new Request.Builder()
+                .url(WCPW_API_URL)
+                .post(body)
+                .build();
 
-                try (Response response = client.newCall(request).execute()) {
-                    System.out.println("   --> 请求发送状态: " + response.code());
-                    if (response.body() != null) {
-                        System.out.println("   --> 响应: " + response.body().string());
-                    }
-                }
-            } catch (Exception e) {
-                System.err.println("   --> 发送失败: " + e.getMessage());
+        client.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                System.err.println("❌ 发送监控请求失败: " + e.getMessage());
             }
-        }).start();
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                System.out.println(">>> 监控请求已发送，状态码: " + response.code());
+                System.out.println(">>> 响应结果: " + response.body().string());
+            }
+        });
     }
 
-    // ================== 验签工具方法 ==================
+    // ================== 核心验签逻辑 (必须与 OrderService 完全同步) ==================
 
     private static boolean verifySignature(Map<String, String> params) {
-        if (!params.containsKey("sign")) {
-            System.err.println("   [Error] 回调参数中缺少 sign 字段");
-            return false;
-        }
+        if (!params.containsKey("sign")) return false;
 
         String incomingSign = params.get("sign");
 
-        // 1. 排除 sign 字段，其余字段按 ASCII 排序
+        // 1. 使用 TreeMap 排序
         Map<String, String> sortedParams = new TreeMap<>(params);
         sortedParams.remove("sign");
 
-        // 2. 拼接 k=v&k=v...&key=SECRET
+        // 2. 拼接 k=v&...
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, String> entry : sortedParams.entrySet()) {
             if (entry.getValue() != null && !entry.getValue().isBlank()) {
                 sb.append(entry.getKey()).append("=").append(entry.getValue()).append("&");
             }
         }
-        sb.append("key=").append(CALLBACK_SECRET);
 
-        // 3. 计算 MD5
+        // 3. 加上 Key (共享密钥)
+        sb.append("key=").append(SHARED_SECRET);
+
+        // 4. MD5 并转大写
         String calculatedSign = md5(sb.toString()).toUpperCase();
 
-        System.out.println("   [Debug] 本地计算签名串: " + sb);
-        System.out.println("   [Debug] 本地计算 Hash : " + calculatedSign);
+        System.out.println("   [验签调试] 待签名串: " + sb);
+        System.out.println("   [验签调试] 计算结果: " + calculatedSign);
+        System.out.println("   [验签调试] 收到签名: " + incomingSign);
 
         return calculatedSign.equals(incomingSign);
     }
@@ -185,41 +197,47 @@ public class AutomatedIntegrationTest {
                 sb.append(Integer.toHexString((b & 0xFF) | 0x100).substring(1, 3));
             }
             return sb.toString();
-        } catch (Exception e) { return ""; }
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private static Map<String, String> parseQueryParams(String query) {
         Map<String, String> map = new HashMap<>();
-        if (query == null || query.isEmpty()) return map;
+        if (query == null || query.isBlank()) return map;
         for (String pair : query.split("&")) {
             String[] kv = pair.split("=", 2);
             if (kv.length == 2) {
-                // URL Decode
-                String key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
-                String val = URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
-                map.put(key, val);
+                map.put(URLDecoder.decode(kv[0], StandardCharsets.UTF_8),
+                        URLDecoder.decode(kv[1], StandardCharsets.UTF_8));
             }
         }
         return map;
     }
 
-    // ================== SSL 绕过工具 ==================
-
     private static OkHttpClient getUnsafeOkHttpClient() {
         try {
             final TrustManager[] trustAllCerts = new TrustManager[]{
                     new X509TrustManager() {
-                        public void checkClientTrusted(X509Certificate[] chain, String authType) {}
-                        public void checkServerTrusted(X509Certificate[] chain, String authType) {}
-                        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[]{}; }
+                        public void checkClientTrusted(X509Certificate[] chain, String authType) {
+                        }
+
+                        public void checkServerTrusted(X509Certificate[] chain, String authType) {
+                        }
+
+                        public X509Certificate[] getAcceptedIssuers() {
+                            return new X509Certificate[]{};
+                        }
                     }
             };
-            final SSLContext sslContext = SSLContext.getInstance("SSL");
+            SSLContext sslContext = SSLContext.getInstance("SSL");
             sslContext.init(null, trustAllCerts, new SecureRandom());
             return new OkHttpClient.Builder()
                     .sslSocketFactory(sslContext.getSocketFactory(), (X509TrustManager) trustAllCerts[0])
                     .hostnameVerifier((hostname, session) -> true)
                     .build();
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 }

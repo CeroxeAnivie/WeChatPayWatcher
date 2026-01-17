@@ -230,11 +230,16 @@ public class Application {
     private static void runMonitorTask(String taskId, DTOs.PaymentRequest req, int timeoutSec) {
         try {
             boolean success = monitorService.monitorPayment(taskId, req.money(), timeoutSec);
-
             String status = success ? "SUCCESS" : "TIMEOUT";
-            // Payload 依然保留，但 Sign 逻辑在 Client 里做
+
+            // 使用新的 DTO，显式带上 taskId(OID)
             DTOs.CallbackPayload payload = new DTOs.CallbackPayload(
-                    status, req.timestamp(), System.currentTimeMillis(), req.money(), status
+                    taskId,
+                    status,
+                    req.timestamp(),
+                    System.currentTimeMillis(),
+                    req.money(),
+                    status
             );
 
             callbackExecutor.submit(() -> {
