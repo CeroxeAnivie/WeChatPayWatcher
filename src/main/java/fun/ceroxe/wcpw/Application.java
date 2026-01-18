@@ -143,9 +143,11 @@ public class Application {
             logger.info("🚀 服务启动 (HTTP) Port: {}", port);
         }
 
-        builder.setHandler(new HttpHandler() {
+        // 核心逻辑逻辑：定义业务处理器
+        HttpHandler businessHandler = new HttpHandler() {
             @Override
             public void handleRequest(HttpServerExchange exchange) throws Exception {
+                // Undertow 习惯用法：如果是 IO 线程则分发到 Worker 线程，以防阻塞 IO
                 if (exchange.isInIoThread()) {
                     exchange.dispatch(this);
                     return;
@@ -156,7 +158,10 @@ public class Application {
                     exchange.setStatusCode(405);
                 }
             }
-        });
+        };
+
+        // 应用安全延迟包装器 (纯升级，无副作用)
+        builder.setHandler(new SecurityDelayHandler(businessHandler));
 
         Undertow server = builder.build();
         server.start();
@@ -192,7 +197,6 @@ public class Application {
                 int timeoutSec = AppConfig.getInt("order.timeout.seconds");
                 currentTaskEndTime.set(System.currentTimeMillis() + (timeoutSec * 1000L));
 
-                // 【优化】尝试从 callbackUrl 中提取 OID 作为 taskId，方便日志对账
                 String taskId = extractOid(req.callbackUrl());
                 logger.info("📥 [API] 接收任务 [{}] | 目标: ¥{} | 回调: {}", taskId, req.money(), req.callbackUrl());
 
@@ -212,7 +216,6 @@ public class Application {
         }
     }
 
-    // 辅助方法：提取OID
     private static String extractOid(String url) {
         try {
             if (url.contains("oid=")) {
@@ -224,7 +227,7 @@ public class Application {
             }
         } catch (Exception ignored) {
         }
-        return UUID.randomUUID().toString().substring(0, 8); // 提取失败则回退到 UUID
+        return UUID.randomUUID().toString().substring(0, 8);
     }
 
     private static void runMonitorTask(String taskId, DTOs.PaymentRequest req, int timeoutSec) {
@@ -232,7 +235,6 @@ public class Application {
             boolean success = monitorService.monitorPayment(taskId, req.money(), timeoutSec);
             String status = success ? "SUCCESS" : "TIMEOUT";
 
-            // 使用新的 DTO，显式带上 taskId(OID)
             DTOs.CallbackPayload payload = new DTOs.CallbackPayload(
                     taskId,
                     status,
@@ -293,5 +295,30 @@ public class Application {
         SSLContext context = SSLContext.getInstance("TLS");
         context.init(kmf.getKeyManagers(), null, null);
         return context;
+    }
+
+    /**
+     * 内部类：安全延迟处理器
+     * 在处理实际业务前，强制休眠 200ms 以过滤快速扫描探测
+     */
+    private record SecurityDelayHandler(HttpHandler next) implements HttpHandler {
+
+        @Override
+        public void handleRequest(HttpServerExchange exchange) throws Exception {
+            // 在分发到业务逻辑之前进行延迟
+            // 如果是 IO 线程，必须先 dispatch 才能 sleep，否则会阻塞 IO 循环
+            if (exchange.isInIoThread()) {
+                exchange.dispatch(this);
+                return;
+            }
+
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+
+            next.handleRequest(exchange);
+        }
     }
 }
