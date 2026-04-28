@@ -10,6 +10,8 @@ import org.slf4j.LoggerFactory;
 import javax.imageio.ImageIO;
 import java.awt.*;
 import java.awt.image.BufferedImage;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -27,6 +29,7 @@ public class WeChatMonitorService {
 
     private static final int ROI_WIDTH = 380;
     private static final int ROI_HEIGHT = 450;
+    private static final Pattern AMOUNT_PATTERN = Pattern.compile("(?<!\\d)(\\d+(?:[.,]\\d{1,2})?)(?!\\d)");
 
     private static final AtomicLong GLOBAL_BASELINE_SERIAL = new AtomicLong(-1);
 
@@ -96,11 +99,15 @@ public class WeChatMonitorService {
 
         try {
             long endTime = System.currentTimeMillis() + (timeoutSeconds * 1000L);
-            String amountStr = String.format("%.2f", targetAmount);
-            String amountNoDot = amountStr.replace(".", "");
+            String amountStr = formatAmount(targetAmount);
+            int startTextFingerprint = scanCurrentTextFingerprint(taskId);
 
             long startBaseline = GLOBAL_BASELINE_SERIAL.get();
-            logger.info("[{}] 👁️ 监控启动 | 当前全局基准: #{} | 目标: ¥{}", taskId, startBaseline, amountStr);
+            logger.info("[{}] 👁️ 监控启动 | 当前全局基准: #{} | 目标: ¥{} | OCR基准指纹: {}",
+                    taskId,
+                    startBaseline,
+                    amountStr,
+                    startTextFingerprint);
 
             int scanCount = 0;
 
@@ -126,28 +133,59 @@ public class WeChatMonitorService {
                         printCleanLog(taskId, scanCount, cost, blocks);
 
                         long currentSerial = 0;
+                        List<String> texts = List.of();
                         if (blocks != null) {
                             currentSerial = findMaxSerialNumber(blocks);
-                            if (currentSerial == -1) currentSerial = 0;
+                            texts = blocks.stream().map(TextBlock::getText).toList();
                         }
 
                         long currentBaseline = GLOBAL_BASELINE_SERIAL.get();
+                        boolean serialChanged = isReliableSerialChange(currentSerial, currentBaseline);
+                        boolean amountMatched = containsExactAmount(texts, amountStr);
+                        boolean receiptContextMatched = hasReceiptContext(texts);
+                        int currentTextFingerprint = fingerprintTexts(texts);
+                        boolean textChangedSinceTaskStart = currentTextFingerprint != startTextFingerprint;
+                        boolean shouldAcceptPayment = shouldAcceptPayment(
+                                currentSerial,
+                                currentBaseline,
+                                amountMatched,
+                                receiptContextMatched,
+                                currentTextFingerprint,
+                                startTextFingerprint
+                        );
 
-                        if (currentSerial != currentBaseline) {
+                        logger.debug("[{}] 🧭 判定: serial={} baseline={} serialChanged={} amountMatched={} receiptContext={} textChanged={} currentFp={} startFp={}",
+                                taskId,
+                                currentSerial,
+                                currentBaseline,
+                                serialChanged,
+                                amountMatched,
+                                receiptContextMatched,
+                                textChangedSinceTaskStart,
+                                currentTextFingerprint,
+                                startTextFingerprint);
+
+                        if (serialChanged) {
                             logger.info("[{}] ⚡ 捕获变动: 基准 #{} -> 当前 #{}", taskId, currentBaseline, currentSerial);
                             GLOBAL_BASELINE_SERIAL.set(currentSerial);
+                        }
 
-                            boolean amountMatched = false;
-                            if (blocks != null) {
-                                amountMatched = checkAmountMatch(blocks, amountStr, amountNoDot);
-                            }
+                        if (shouldAcceptPayment) {
+                            logger.info("[{}] ✅✅✅ 支付成功: 单号 #{} | 金额 ¥{} | serialChanged={} | textChanged={}",
+                                    taskId,
+                                    currentSerial,
+                                    amountStr,
+                                    serialChanged,
+                                    textChangedSinceTaskStart);
+                            return true;
+                        }
 
-                            if (amountMatched) {
-                                logger.info("[{}] ✅✅✅ 支付成功: 单号 #{} | 金额 ¥{} | 基准已刷新", taskId, currentSerial, amountStr);
-                                return true;
-                            } else {
-                                logger.warn("[{}] ⚠️ 忽略: 单号变动 #{} 但金额不符 (期望 ¥{}) -> 基准已更新", taskId, currentSerial, amountStr);
-                            }
+                        if (serialChanged) {
+                            logger.warn("[{}] ⚠️ 忽略: 单号变动 #{} 但未满足支付判定 (amountMatched={}, receiptContext={}) -> 基准已更新",
+                                    taskId,
+                                    currentSerial,
+                                    amountMatched,
+                                    receiptContextMatched);
                         }
 
                     } finally {
@@ -235,12 +273,125 @@ public class WeChatMonitorService {
         return max;
     }
 
-    private boolean checkAmountMatch(List<TextBlock> blocks, String target, String targetNoDot) {
-        for (TextBlock block : blocks) {
-            String clean = block.getText().replaceAll("[^0-9.]", "");
-            if (clean.equals(target) || clean.contains(target) || clean.equals(targetNoDot)) return true;
+    private boolean checkAmountMatch(List<TextBlock> blocks, String target) {
+        List<String> texts = blocks.stream().map(TextBlock::getText).toList();
+        return containsExactAmount(texts, target);
+    }
+
+    static boolean containsExactAmount(List<String> texts, String target) {
+        if (texts == null || texts.isEmpty()) return false;
+
+        String normalizedTarget = normalizeAmount(target);
+        if (normalizedTarget == null) return false;
+
+        for (String text : candidateAmountTexts(texts)) {
+            if (text == null || text.isBlank()) continue;
+
+            String normalizedText = normalizeOcrText(text);
+            Matcher matcher = AMOUNT_PATTERN.matcher(normalizedText);
+            while (matcher.find()) {
+                String candidate = normalizeAmount(matcher.group(1));
+                if (normalizedTarget.equals(candidate)) {
+                    return true;
+                }
+            }
         }
         return false;
+    }
+
+    static boolean hasReceiptContext(List<String> texts) {
+        if (texts == null || texts.isEmpty()) return false;
+        String normalizedText = normalizeOcrText(String.join("", texts));
+        return normalizedText.contains("收款到账通知")
+                || (normalizedText.contains("收款金额")
+                && (normalizedText.contains("收款成功")
+                || normalizedText.contains("已存入零钱")
+                || normalizedText.contains("今日第")))
+                || (normalizedText.contains("微信支付") && normalizedText.contains("收款"));
+    }
+
+    static boolean isReliableSerialChange(long currentSerial, long currentBaseline) {
+        return currentSerial > 0 && currentSerial != currentBaseline;
+    }
+
+    static boolean shouldAcceptPayment(
+            long currentSerial,
+            long currentBaseline,
+            boolean amountMatched,
+            boolean receiptContextMatched,
+            int currentTextFingerprint,
+            int startTextFingerprint
+    ) {
+        if (!amountMatched || !receiptContextMatched) {
+            return false;
+        }
+        if (isReliableSerialChange(currentSerial, currentBaseline)) {
+            return true;
+        }
+        return currentTextFingerprint != 0 && currentTextFingerprint != startTextFingerprint;
+    }
+
+    static int fingerprintTexts(List<String> texts) {
+        if (texts == null || texts.isEmpty()) return 0;
+        String normalized = texts.stream()
+                .filter(text -> text != null && !text.isBlank())
+                .map(WeChatMonitorService::normalizeOcrText)
+                .collect(Collectors.joining("|"));
+        return normalized.hashCode();
+    }
+
+    static String formatAmount(double amount) {
+        return BigDecimal.valueOf(amount).setScale(2, RoundingMode.HALF_UP).toPlainString();
+    }
+
+    private static List<String> candidateAmountTexts(List<String> texts) {
+        String joined = String.join("", texts);
+        if (joined.isBlank()) return texts;
+        return java.util.stream.Stream.concat(texts.stream(), java.util.stream.Stream.of(joined)).toList();
+    }
+
+    private static String normalizeOcrText(String text) {
+        return text.replace('，', '.')
+                .replace('。', '.')
+                .replaceAll("\\s+", "");
+    }
+
+    private static String normalizeAmount(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            String cleaned = raw.trim()
+                    .replace(',', '.')
+                    .replaceAll("[^0-9.]", "");
+            if (cleaned.isBlank()) return null;
+            return new BigDecimal(cleaned).setScale(2, RoundingMode.HALF_UP).toPlainString();
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private int scanCurrentTextFingerprint(String taskId) {
+        Path tempFile = null;
+        try {
+            BufferedImage frame = captureROI();
+            tempFile = Files.createTempFile("scan_start_", ".png");
+            ImageIO.write(frame, "png", tempFile.toFile());
+
+            OcrResult result = engine.runOcr(tempFile.toAbsolutePath().toString());
+            List<TextBlock> blocks = (result != null) ? result.getTextBlocks() : null;
+            if (blocks == null) return 0;
+            List<String> texts = blocks.stream().map(TextBlock::getText).toList();
+            int fingerprint = fingerprintTexts(texts);
+            logger.debug("[{}] 🧭 任务启动 OCR 基准 -> fp={} [{}]",
+                    taskId,
+                    fingerprint,
+                    texts.stream().map(String::trim).collect(Collectors.joining(" | ")));
+            return fingerprint;
+        } catch (Exception e) {
+            logger.debug("[{}] 任务启动 OCR 基准采集失败，后续使用首轮扫描兜底", taskId, e);
+            return 0;
+        } finally {
+            deleteTempFile(tempFile);
+        }
     }
 
     private void performWarmUp() {

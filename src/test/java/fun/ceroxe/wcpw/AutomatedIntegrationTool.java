@@ -23,18 +23,18 @@ import java.util.TreeMap;
  * 微信支付全链条安全集成测试工具 (NAS 模拟器)
  * 覆盖：预支付请求 -> 异步回调 -> 字段提取 -> 签名算法验证 -> JSON Payload 校验
  */
-public class AutomatedIntegrationTest {
+public class AutomatedIntegrationTool {
 
     // ================= 配置区域 (请根据实际环境修改) =================
 
     // 1. WCPW 守卫服务的 API 地址
     private static final String WCPW_API_URL = "http://127.0.0.1:9090/";
 
-    // 2. 鉴权 Token (对应 WCPW 的 auth.token)
-    private static final String AUTH_TOKEN = "YOUR_API_ACCESS_TOKEN";
+    // 2. 鉴权 Token (对应 WCPW 的 wcpw.request_token)
+    private static final String AUTH_TOKEN = "wcpw-request-token";
 
-    // 3. 共享密钥 (对应 WCPW 的 callback.secret 和 NAS 的 wcpw.token)
-    private static final String SHARED_SECRET = "YOUR_SHARED_SECRET_KEY";
+    // 3. 共享密钥 (对应 WCPW 的 wcpw.callback_secret 和 NAS 的 wcpw.callback_secret)
+    private static final String SHARED_SECRET = "wcpw-callback-secret";
 
     // 4. 本机模拟监听端口
     private static final int NAS_SIMULATOR_PORT = 47891;

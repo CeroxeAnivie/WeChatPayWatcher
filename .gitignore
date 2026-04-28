@@ -1,4 +1,9 @@
 target/
+
+# Runtime-local configuration and logs generated beside the runnable jar.
+/config.properties
+/logs/
+
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/

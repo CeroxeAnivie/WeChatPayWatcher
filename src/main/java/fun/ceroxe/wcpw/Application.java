@@ -37,9 +37,14 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -52,9 +57,17 @@ public class Application {
 
     private static final ExecutorService monitorExecutor = Executors.newSingleThreadExecutor();
     private static final ExecutorService callbackExecutor = Executors.newCachedThreadPool();
+    private static final ScheduledExecutorService callbackRecoveryExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "Callback-Recovery-Thread");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final Set<String> callbacksInFlight = ConcurrentHashMap.newKeySet();
+    private static final Map<String, DTOs.DurableCallbackTask> volatileCallbackQueue = new ConcurrentHashMap<>();
 
     private static WeChatMonitorService monitorService;
     private static CallbackClient callbackClient;
+    private static DurableCallbackStore callbackStore;
 
     public static void main(String[] args) {
         initLogging();
@@ -76,6 +89,9 @@ public class Application {
         }
 
         callbackClient = new CallbackClient();
+        callbackStore = new DurableCallbackStore();
+        recoverPendingCallbacks();
+        callbackRecoveryExecutor.scheduleWithFixedDelay(Application::recoverPendingCallbacks, 30, 60, TimeUnit.SECONDS);
         startUndertowServer();
     }
 
@@ -171,6 +187,7 @@ public class Application {
             server.stop();
             monitorExecutor.shutdownNow();
             callbackExecutor.shutdownNow();
+            callbackRecoveryExecutor.shutdownNow();
         }));
     }
 
@@ -186,7 +203,7 @@ public class Application {
                 return;
             }
 
-            String serverToken = AppConfig.get("auth.token");
+            String serverToken = AppConfig.get("wcpw.request_token");
             if (!serverToken.equals(req.token())) {
                 logger.warn("⛔ [API] 鉴权失败 | IP: {} | Token: {}", exchange.getSourceAddress(), req.token());
                 sendJson(exchange, 401, new DTOs.BaseResponse("UNAUTHORIZED", "Invalid Token", null));
@@ -244,15 +261,83 @@ public class Application {
                     status
             );
 
-            callbackExecutor.submit(() -> {
-                callbackClient.sendCallback(taskId, req.callbackUrl(), payload);
-                isPending.set(false);
-                logger.info("🔓 [API] 任务 [{}] 结束，锁已释放", taskId);
-            });
+            DTOs.DurableCallbackTask task = new DTOs.DurableCallbackTask(
+                    UUID.randomUUID().toString(),
+                    taskId,
+                    req.callbackUrl(),
+                    payload
+            );
+            persistAndDispatchCallback(task, true);
 
         } catch (Exception e) {
             logger.error("💥 [API] 任务执行崩溃", e);
             isPending.set(false);
+        }
+    }
+
+    private static void persistAndDispatchCallback(DTOs.DurableCallbackTask task, boolean releasePaymentLock) {
+        boolean durable = false;
+        try {
+            callbackStore.save(task);
+            durable = true;
+        } catch (Exception e) {
+            // 落盘失败后仍保留进程内重试队列。它不能替代磁盘持久化，但能避免一次 IO 抖动
+            // 直接吞掉已经确认的支付结果。
+            volatileCallbackQueue.put(task.recordId(), task);
+            logger.error("🚨 [Callback] 任务 [{}] 持久化失败，已转入进程内重试队列: {}", task.taskId(), task.recordId(), e);
+        }
+
+        boolean durableRecord = durable;
+        callbackExecutor.submit(() -> dispatchCallback(task, releasePaymentLock, durableRecord));
+    }
+
+    private static void recoverPendingCallbacks() {
+        if (callbackStore == null || callbackClient == null) return;
+        List<DTOs.DurableCallbackTask> pendingTasks = callbackStore.loadAll();
+        if (!pendingTasks.isEmpty()) {
+            logger.info("🔁 发现 {} 条待恢复回调", pendingTasks.size());
+        }
+        for (DTOs.DurableCallbackTask task : pendingTasks) {
+            callbackExecutor.submit(() -> dispatchCallback(task, false, true));
+        }
+
+        if (!volatileCallbackQueue.isEmpty()) {
+            logger.warn("🔁 发现 {} 条进程内待重试回调 (磁盘持久化此前失败)", volatileCallbackQueue.size());
+        }
+        for (DTOs.DurableCallbackTask task : volatileCallbackQueue.values()) {
+            callbackExecutor.submit(() -> dispatchCallback(task, false, false));
+        }
+    }
+
+    private static void dispatchCallback(DTOs.DurableCallbackTask task, boolean releasePaymentLock, boolean durableRecord) {
+        String taskId = task.taskId();
+        String recordId = task.recordId();
+        if (!callbacksInFlight.add(recordId)) {
+            if (releasePaymentLock) {
+                isPending.set(false);
+            }
+            return;
+        }
+        try {
+            boolean delivered = callbackClient.sendCallback(taskId, task.callbackUrl(), task.payload());
+            if (delivered) {
+                if (durableRecord) {
+                    callbackStore.delete(task);
+                } else {
+                    volatileCallbackQueue.remove(recordId);
+                }
+                logger.info("✅ [Callback] 任务 [{}] 已确认送达 | recordId={}", taskId, recordId);
+            } else {
+                logger.error("❌ [Callback] 任务 [{}] 回调失败，已保留{}等待后续重试",
+                        taskId,
+                        durableRecord ? "持久记录" : "进程内记录");
+            }
+        } finally {
+            callbacksInFlight.remove(recordId);
+            if (releasePaymentLock) {
+                isPending.set(false);
+                logger.info("🔓 [API] 任务 [{}] 结束，锁已释放", taskId);
+            }
         }
     }
 

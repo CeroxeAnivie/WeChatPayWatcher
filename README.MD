@@ -4,7 +4,7 @@
 
 核心原理：**HTTP 请求唤醒 -> 锁定任务 -> 屏幕变化检测 -> OCR 识别金额 -> <font color="red">生成安全签名</font> -> 回调业务系统**。
 
-> 🛡️ **安全升级 (v2.1)**: 本版本引入了**首包 200ms 安全延迟**与**强制 MD5 字典序签名**机制。配合虚拟线程技术，在彻底防止伪造回调攻击与恶意扫描的同时，保持极高的并发处理能力。
+> 🛡️ **可靠性升级 (v2.0.3)**: 本版本引入了**持久化回调队列**、**失败重试**与**强制 MD5 字典序签名**机制。回调在发送前会先落盘，进程重启后会自动恢复未确认送达的回调。
 
 ---
 
@@ -47,13 +47,17 @@ java -jar WeChatPayWatcher-X.X.X.jar
 server.port=9090
 
 # 【必须修改】鉴权 Token，用于调用 WCPW
-auth.token=YOUR_API_ACCESS_TOKEN
+wcpw.request_token=YOUR_API_ACCESS_TOKEN
 
 # 【新增必填】回调签名密钥，必须与你的业务系统 (如 NeoAuthServer) 一致
-callback.secret=YOUR_SHARED_SECRET_KEY
+wcpw.callback_secret=YOUR_SHARED_SECRET_KEY
 
 # 订单超时时间 (秒)
-order.timeout.seconds=300
+order.timeout.seconds=120
+
+# 回调重试配置
+callback.retry.count=3
+callback.retry.interval.ms=2000
 ```
 
 ---
@@ -68,7 +72,7 @@ order.timeout.seconds=300
 #### 请求参数 (JSON)
 | 字段            | 类型     | 必填 | 说明                                         |
 |:--------------|:-------|:---|:-------------------------------------------|
-| `token`       | String | 是  | 必须与 `config.properties` 中的 `auth.token` 一致 |
+| `token`       | String | 是  | 必须与 `config.properties` 中的 `wcpw.request_token` 一致 |
 | `money`       | Number | 是  | 期望收到的金额 (例如 1.39)                          |
 | `timestamp`   | String | 是  | 业务时间戳                                      |
 | `callbackUrl` | String | 是  | **关键**: 必须包含你的订单号参数 (如 `?oid=xxxxx`)       |

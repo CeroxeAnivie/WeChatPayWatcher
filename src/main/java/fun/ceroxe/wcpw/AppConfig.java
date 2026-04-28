@@ -41,8 +41,8 @@ public class AppConfig {
     }
 
     private static void validateConfig() {
-        // 【关键修改】加入 callback.secret 为必填项，用于签名
-        String[] requiredKeys = {"server.port", "auth.token", "callback.secret"};
+        // 回调签名密钥必须显式配置，避免和入口请求鉴权令牌混用。
+        String[] requiredKeys = {"server.port", "wcpw.request_token", "wcpw.callback_secret"};
         for (String key : requiredKeys) {
             if (props.getProperty(key) == null || props.getProperty(key).isBlank()) {
                 throw new RuntimeException("❌ 配置文件错误: 缺少关键项 [" + key + "]");

@@ -25,4 +25,12 @@ public class DTOs {
             String message
     ) {
     }
+
+    public record DurableCallbackTask(
+            String recordId,
+            String taskId,
+            String callbackUrl,
+            CallbackPayload payload
+    ) {
+    }
 }
