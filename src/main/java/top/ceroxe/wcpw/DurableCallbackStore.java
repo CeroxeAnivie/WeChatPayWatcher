@@ -1,4 +1,4 @@
-package fun.ceroxe.wcpw;
+package top.ceroxe.wcpw;
 
 import com.google.gson.Gson;
 import org.slf4j.Logger;
@@ -19,6 +19,8 @@ public class DurableCallbackStore {
     private static final Logger logger = LoggerFactory.getLogger(DurableCallbackStore.class);
     private static final Gson gson = new Gson();
     private final Path queueDir;
+    private final Path failedDir;
+    private final long maxRecordBytes;
 
     public DurableCallbackStore() {
         this(Path.of("callback_queue"));
@@ -26,8 +28,12 @@ public class DurableCallbackStore {
 
     DurableCallbackStore(Path queueDir) {
         this.queueDir = queueDir;
+        this.failedDir = queueDir.resolve("failed");
+        int configuredMaxBytes = AppConfig.getInt("callback.queue.max.record.bytes", 1_048_576);
+        this.maxRecordBytes = Math.max(4_096L, Math.min(16L * 1024 * 1024, configuredMaxBytes));
         try {
             Files.createDirectories(queueDir);
+            Files.createDirectories(failedDir);
         } catch (IOException e) {
             throw new RuntimeException("无法创建回调持久化目录: " + queueDir.toAbsolutePath(), e);
         }
@@ -54,7 +60,7 @@ public class DurableCallbackStore {
             stream.filter(path -> path.getFileName().toString().endsWith(".json"))
                     .forEach(path -> loadOne(path, tasks));
         } catch (IOException e) {
-            logger.error("扫描持久回调队列失败", e);
+            logger.error("扫描持久回调队列失败 | reason={}", LogSupport.describe(e));
         }
         return tasks;
     }
@@ -64,12 +70,23 @@ public class DurableCallbackStore {
         try {
             Files.deleteIfExists(fileFor(resolveRecordId(task)));
         } catch (IOException e) {
-            logger.error("[{}] 删除持久回调记录失败", task.taskId(), e);
+            logger.error("[{}] 删除持久回调记录失败 | reason={}", task.taskId(), LogSupport.describe(e));
         }
+    }
+
+    public void markFailed(DTOs.DurableCallbackTask task) throws IOException {
+        if (task == null) return;
+        Path source = fileFor(resolveRecordId(task));
+        Path target = failedDir.resolve(source.getFileName());
+        moveIntoPlace(source, target);
     }
 
     private void loadOne(Path path, List<DTOs.DurableCallbackTask> tasks) {
         try {
+            if (Files.size(path) > maxRecordBytes) {
+                logger.error("持久回调记录超过大小上限，已跳过: {}", path);
+                return;
+            }
             String json = Files.readString(path, StandardCharsets.UTF_8);
             DTOs.DurableCallbackTask task = gson.fromJson(json, DTOs.DurableCallbackTask.class);
             if (task != null && task.taskId() != null && task.callbackUrl() != null && task.payload() != null) {
@@ -78,7 +95,7 @@ public class DurableCallbackStore {
                 logger.error("持久回调记录无效: {}", path);
             }
         } catch (Exception e) {
-            logger.error("读取持久回调记录失败: {}", path, e);
+            logger.error("读取持久回调记录失败: {} | reason={}", path, LogSupport.describe(e));
         }
     }
 
@@ -89,9 +106,9 @@ public class DurableCallbackStore {
 
     private void moveIntoPlace(Path tmp, Path target) throws IOException {
         try {
-            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException e) {
-            Files.move(tmp, target);
+            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -103,7 +120,9 @@ public class DurableCallbackStore {
                 stripJsonSuffix(sourcePath.getFileName().toString()),
                 task.taskId(),
                 task.callbackUrl(),
-                task.payload()
+                task.payload(),
+                Math.max(0, task.attemptsMade()),
+                Math.max(0L, task.nextAttemptAt())
         );
     }
 

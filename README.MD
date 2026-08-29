@@ -4,7 +4,7 @@
 
 核心原理：**HTTP 请求唤醒 -> 锁定任务 -> 屏幕变化检测 -> OCR 识别金额 -> <font color="red">生成安全签名</font> -> 回调业务系统**。
 
-> 🛡️ **可靠性升级 (v2.0.3)**: 本版本引入了**持久化回调队列**、**失败重试**与**强制 MD5 字典序签名**机制。回调在发送前会先落盘，进程重启后会自动恢复未确认送达的回调。
+> 🛡️ **支付判定修复 (v2.1.3)**: 使用轻量 `ONNX_PPOCR_V4`，仅以微信界面的 `今日第 X 笔` 变化认定新账，再按最大字号 OCR 候选和完整金额 token 精确比较；`1.00` 不会命中 `0.01`、`11.00` 或 `100.00`。
 
 ---
 
@@ -45,6 +45,8 @@ java -jar WeChatPayWatcher-X.X.X.jar
 ```properties
 # 服务端口
 server.port=9090
+# 监听地址（生产环境通常由反向代理暴露；本地/VNC 可保持 0.0.0.0）
+server.bind.host=0.0.0.0
 
 # 【必须修改】鉴权 Token，用于调用 WCPW
 wcpw.request_token=YOUR_API_ACCESS_TOKEN
@@ -54,10 +56,24 @@ wcpw.callback_secret=YOUR_SHARED_SECRET_KEY
 
 # 订单超时时间 (秒)
 order.timeout.seconds=120
+order.timeout.max.seconds=900
 
-# 回调重试配置
+# 单次 API 请求体和订单金额上限
+request.max.body.bytes=65536
+order.max.amount=1000000
+
+# 回调发送总次数上限（允许 1-3；默认和硬上限均为 3）
 callback.retry.count=3
+# 两次回调请求之间的等待时间（毫秒，默认 2000）
 callback.retry.interval.ms=2000
+callback.queue.max.record.bytes=1048576
+
+# callbackUrl 仍由已认证调用方指定；仅限制协议和长度
+callback.allowed.schemes=http,https
+callback.url.max.length=2048
+
+# 默认保持旧系统兼容；新接收方建议使用 HMAC-SHA256
+callback.signature.algorithm=MD5
 ```
 
 ---
@@ -82,7 +98,11 @@ callback.retry.interval.ms=2000
 ### 2. 支付结果回调 (核心安全机制)
 当检测到收款成功或超时，WCPW 会向你的 `callbackUrl` 发起 POST 请求。
 
-**⚠️ 注意：WCPW 会根据 TreeMap 自动生成的字典序追加签名参数。**
+每条回调全生命周期最多发送 `callback.retry.count` 次。失败后按照 `callback.retry.interval.ms` 等待再进行下一次发送，默认间隔为 2000ms；尝试次数和下一次允许发送的时间都会写入 `callback_queue`，进程重启后只继续剩余次数且不会绕过等待时间。次数耗尽后记录移入 `callback_queue/failed` 供人工核查，不存在每分钟重新获得三次机会的“恢复周期”。
+
+每一次实际 HTTP 回调请求都会分别记录开始和结果日志；前两次失败会额外记录按配置计算的重试计划，最后一次失败仍保留自己的失败日志，然后再记录一次最终耗尽摘要。普通失败不打印 Java 堆栈。
+
+**⚠️ 注意：WCPW 会根据 TreeMap 自动生成的字典序追加签名参数，并保留 callbackUrl 中的其他 query 参数。**
 
 *   **Method**: `POST`
 *   **URL 示例**: `.../callback?oid=xxx&money=1.39&status=SUCCESS&timestamp=...&sign=MD5_SIGNATURE`
@@ -92,25 +112,34 @@ callback.retry.interval.ms=2000
 
 1.  **参数排序**: 将 `money`, `oid`, `status`, `timestamp` 按 Key 的 ASCII 码从小到大排序。
 2.  **拼接格式**: `money=val&oid=val&status=val&timestamp=val&key=YOUR_CALLBACK_SECRET`。
-3.  **生成签名**: 对拼接后的字符串进行 **MD5** 运算，并转为**大写**。
+3.  **生成签名**: 默认对拼接后的字符串进行 **MD5** 运算并转为大写；配置 `callback.signature.algorithm=HMAC-SHA256` 时改用 HMAC-SHA256。
 
 **签名原串示例 (严格字典序):**
 ```text
 money=1.39&oid=ORDER_001&status=SUCCESS&timestamp=1768156200000&key=YOUR_SHARED_SECRET_KEY
 ```
 
+### 3. 2c2g Debian 部署建议
+
+*   使用 RapidOCR 内置的 ONNX PPOCRv4 模型，不需要额外模型服务、Python 进程或 GPU。
+*   使用 JDK 21，建议通过 systemd/cgroup 限制 CPU 和内存；JVM 堆可从 `-Xmx384m` 起步后按实测调整。
+*   `java.awt.Robot` 需要 X11/VNC/Xvfb，真正的 headless 环境无法识别屏幕。
+*   生产环境建议让 Nginx/Caddy 负责 HTTPS，WCPW 绑定 `127.0.0.1`；HTTP fallback 仍保留用于本地/VNC 场景。
+
 ---
 
 ## 📂 日志说明
 
 系统会自动在 `logs` 文件夹记录详细的监控轨迹：
-*   **[Motion]**: 检测到画面像素变化超过 5%，触发 OCR 扫描。
-*   **[Heartbeat]**: 画面静止超过 20 秒，触发强制心跳扫描以校准基准。
+*   请求通过鉴权并取得唯一任务锁后，服务立即 OCR 屏幕右下角 `380×450` 区域，以微信当前的 `今日第 X 笔` 建立该订单专属基线；只有成功识别到合法的 `X` 才返回 `READY`。
+*   基线建立完成后，任务每 5 秒重新截取同一区域并执行 OCR；只有微信界面中的 `今日第 X 笔` 相对本次订单基线发生变化时才检查金额。
+*   微信计数未变化时继续等待；计数变化后，无论递增还是递减，都用最大字号的完整金额 token 判定本次金额并更新基线。
+*   普通运行错误只记录异常类型和简短原因，不打印 Java 调用堆栈。
 
 **日志示例:**
 ```text
-14:32:10 INFO - [ORDER_001] 📸 #15 [Motion] 耗时 500ms -> [收款到账通知 | ￥1.39]
-14:32:30 INFO - [ORDER_001] 📸 #16 [Heartbeat] 耗时 380ms -> [微信支付 | 收款成功]
+14:32:10 INFO - [ORDER_001] 📸 #15 耗时 500ms -> [收款到账通知 | ￥1.39]
+14:32:15 INFO - [ORDER_001] 📸 #16 耗时 380ms -> [微信支付 | 收款成功]
 ```
 
 ---

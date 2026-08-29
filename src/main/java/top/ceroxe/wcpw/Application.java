@@ -1,4 +1,4 @@
-package fun.ceroxe.wcpw;
+package top.ceroxe.wcpw;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -7,6 +7,7 @@ import ch.qos.logback.classic.encoder.PatternLayoutEncoder;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.FileAppender;
 import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
 import io.undertow.Undertow;
 import io.undertow.server.HttpHandler;
 import io.undertow.server.HttpServerExchange;
@@ -38,12 +39,14 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -56,18 +59,22 @@ public class Application {
     private static final AtomicLong currentTaskEndTime = new AtomicLong(0);
 
     private static final ExecutorService monitorExecutor = Executors.newSingleThreadExecutor();
-    private static final ExecutorService callbackExecutor = Executors.newCachedThreadPool();
-    private static final ScheduledExecutorService callbackRecoveryExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "Callback-Recovery-Thread");
-        t.setDaemon(true);
-        return t;
-    });
+    private static final ThreadPoolExecutor callbackExecutor = new ThreadPoolExecutor(
+            1,
+            2,
+            30,
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(100),
+            Executors.defaultThreadFactory(),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+    );
     private static final Set<String> callbacksInFlight = ConcurrentHashMap.newKeySet();
     private static final Map<String, DTOs.DurableCallbackTask> volatileCallbackQueue = new ConcurrentHashMap<>();
 
     private static WeChatMonitorService monitorService;
     private static CallbackClient callbackClient;
     private static DurableCallbackStore callbackStore;
+    private static SecurityPolicy securityPolicy;
 
     public static void main(String[] args) {
         initLogging();
@@ -79,19 +86,19 @@ public class Application {
 
         Security.addProvider(new BouncyCastleProvider());
         AppConfig.init();
+        securityPolicy = new SecurityPolicy();
 
         try {
             logger.info("⚙️ 正在启动 OCR 引擎...");
             monitorService = new WeChatMonitorService();
         } catch (Throwable e) {
-            logger.error("❌ OCR 引擎启动失败 (请检查 libgomp1 / libgl1-mesa-glx)", e);
+            logger.error("❌ OCR 引擎启动失败 | reason={}", LogSupport.describe(e));
             System.exit(1);
         }
 
         callbackClient = new CallbackClient();
         callbackStore = new DurableCallbackStore();
-        recoverPendingCallbacks();
-        callbackRecoveryExecutor.scheduleWithFixedDelay(Application::recoverPendingCallbacks, 30, 60, TimeUnit.SECONDS);
+        recoverPersistedCallbacksOnStartup();
         startUndertowServer();
     }
 
@@ -146,17 +153,18 @@ public class Application {
                 }
             }
         } catch (Exception e) {
-            logger.error("❌ SSL 加载失败", e);
+            logger.error("❌ SSL 加载失败 | reason={}", LogSupport.describe(e));
             System.exit(1);
         }
 
         Undertow.Builder builder = Undertow.builder();
+        String bindHost = AppConfig.get("server.bind.host", "0.0.0.0");
         if (sslContext != null) {
-            builder.addHttpsListener(port, "0.0.0.0", sslContext);
-            logger.info("🚀 服务启动 (HTTPS) Port: {}", port);
+            builder.addHttpsListener(port, bindHost, sslContext);
+            logger.info("🚀 服务启动 (HTTPS) {}:{}", bindHost, port);
         } else {
-            builder.addHttpListener(port, "0.0.0.0");
-            logger.info("🚀 服务启动 (HTTP) Port: {}", port);
+            builder.addHttpListener(port, bindHost);
+            logger.info("🚀 服务启动 (HTTP) {}:{}", bindHost, port);
         }
 
         // 核心逻辑逻辑：定义业务处理器
@@ -185,39 +193,66 @@ public class Application {
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             server.stop();
+            if (monitorService != null) monitorService.shutdown();
             monitorExecutor.shutdownNow();
             callbackExecutor.shutdownNow();
-            callbackRecoveryExecutor.shutdownNow();
         }));
     }
 
     private static void handlePaymentRequest(HttpServerExchange exchange) {
         try {
             exchange.startBlocking();
-            String body = new String(exchange.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            DTOs.PaymentRequest req = gson.fromJson(body, DTOs.PaymentRequest.class);
+            String body = readRequestBody(exchange, securityPolicy.maxRequestBodyBytes());
+            DTOs.PaymentRequest req;
+            try {
+                req = gson.fromJson(body, DTOs.PaymentRequest.class);
+            } catch (JsonSyntaxException e) {
+                sendJson(exchange, 400, new DTOs.BaseResponse("ERROR", "Invalid JSON", null));
+                return;
+            }
 
-            if (req == null || req.money() <= 0 || req.callbackUrl() == null) {
-                logger.warn("⚠️ [API] 参数无效: {}", body);
+            String validationError = securityPolicy.validatePaymentRequest(req);
+            if (validationError != null) {
+                logger.warn("⚠️ [API] 参数无效: {}", validationError);
                 sendJson(exchange, 400, new DTOs.BaseResponse("ERROR", "Invalid Parameters", null));
                 return;
             }
 
             String serverToken = AppConfig.get("wcpw.request_token");
-            if (!serverToken.equals(req.token())) {
-                logger.warn("⛔ [API] 鉴权失败 | IP: {} | Token: {}", exchange.getSourceAddress(), req.token());
+            if (!securityPolicy.matchesToken(serverToken, req.token())) {
+                logger.warn("⛔ [API] 鉴权失败 | IP: {}", exchange.getSourceAddress());
                 sendJson(exchange, 401, new DTOs.BaseResponse("UNAUTHORIZED", "Invalid Token", null));
                 return;
             }
 
             if (isPending.compareAndSet(false, true)) {
-                int timeoutSec = AppConfig.getInt("order.timeout.seconds");
-                currentTaskEndTime.set(System.currentTimeMillis() + (timeoutSec * 1000L));
+                int timeoutSec = securityPolicy.normalizeOrderTimeoutSeconds(
+                        AppConfig.getInt("order.timeout.seconds", 120));
 
                 String taskId = extractOid(req.callbackUrl());
-                logger.info("📥 [API] 接收任务 [{}] | 目标: ¥{} | 回调: {}", taskId, req.money(), req.callbackUrl());
+                OptionalLong requestBaseline = monitorService.beginMonitoringTask(taskId);
+                if (requestBaseline.isEmpty()) {
+                    isPending.set(false);
+                    currentTaskEndTime.set(0L);
+                    logger.error("❌ [API] 未识别到微信当前的今日第 X 笔，任务未启动 | taskId={}", taskId);
+                    sendJson(exchange, 503,
+                            new DTOs.BaseResponse("ERROR", "Payment Baseline Unavailable", null));
+                    return;
+                }
 
-                monitorExecutor.submit(() -> runMonitorTask(taskId, req, timeoutSec));
+                currentTaskEndTime.set(System.currentTimeMillis() + (timeoutSec * 1000L));
+                logger.info("📥 [API] 接收任务 [{}] | 目标: ¥{} | 回调主机: {}",
+                        taskId, req.money(), callbackHost(req.callbackUrl()));
+
+                try {
+                    monitorExecutor.submit(() -> runMonitorTask(
+                            taskId, req, timeoutSec, requestBaseline.getAsLong()));
+                } catch (RuntimeException e) {
+                    monitorService.cancelPreparedTask(taskId);
+                    isPending.set(false);
+                    currentTaskEndTime.set(0L);
+                    throw e;
+                }
 
                 sendJson(exchange, 200, new DTOs.BaseResponse("READY", "Monitoring Started", null));
             } else {
@@ -226,8 +261,10 @@ public class Application {
                 logger.info("⏳ [API] 系统忙碌，拒绝新请求 (剩余 {}s)", waitSec);
                 sendJson(exchange, 200, new DTOs.BaseResponse("PENDING", "System Busy", new DTOs.PendingData(waitSec)));
             }
+        } catch (RequestTooLargeException e) {
+            // The helper has already sent the 413 response.
         } catch (Exception e) {
-            logger.error("❌ [API] 内部错误", e);
+            logger.error("❌ [API] 内部错误 | reason={}", LogSupport.describe(e));
             isPending.set(false);
             sendJson(exchange, 500, new DTOs.BaseResponse("ERROR", e.getMessage(), null));
         }
@@ -235,21 +272,26 @@ public class Application {
 
     private static String extractOid(String url) {
         try {
-            if (url.contains("oid=")) {
-                String[] parts = url.split("oid=");
-                if (parts.length > 1) {
-                    String oid = parts[1].split("&")[0];
-                    if (!oid.isBlank()) return oid;
-                }
+            okhttp3.HttpUrl parsed = okhttp3.HttpUrl.parse(url);
+            if (parsed != null) {
+                String oid = parsed.queryParameter("oid");
+                if (oid != null && !oid.isBlank()) return oid;
             }
         } catch (Exception ignored) {
+            // SecurityPolicy validates the URL before this method is called.
         }
         return UUID.randomUUID().toString().substring(0, 8);
     }
 
-    private static void runMonitorTask(String taskId, DTOs.PaymentRequest req, int timeoutSec) {
+    private static void runMonitorTask(
+            String taskId,
+            DTOs.PaymentRequest req,
+            int timeoutSec,
+            long requestBaseline
+    ) {
         try {
-            boolean success = monitorService.monitorPayment(taskId, req.money(), timeoutSec);
+            boolean success = monitorService.monitorPayment(
+                    taskId, req.money(), timeoutSec, requestBaseline);
             String status = success ? "SUCCESS" : "TIMEOUT";
 
             DTOs.CallbackPayload payload = new DTOs.CallbackPayload(
@@ -270,7 +312,7 @@ public class Application {
             persistAndDispatchCallback(task, true);
 
         } catch (Exception e) {
-            logger.error("💥 [API] 任务执行崩溃", e);
+            logger.error("💥 [API] 任务执行崩溃 | taskId={} | reason={}", taskId, LogSupport.describe(e));
             isPending.set(false);
         }
     }
@@ -284,28 +326,22 @@ public class Application {
             // 落盘失败后仍保留进程内重试队列。它不能替代磁盘持久化，但能避免一次 IO 抖动
             // 直接吞掉已经确认的支付结果。
             volatileCallbackQueue.put(task.recordId(), task);
-            logger.error("🚨 [Callback] 任务 [{}] 持久化失败，已转入进程内重试队列: {}", task.taskId(), task.recordId(), e);
+            logger.error("🚨 [Callback] 持久化失败，已转入进程内重试队列 | taskId={} | recordId={} | reason={}",
+                    task.taskId(), task.recordId(), LogSupport.describe(e));
         }
 
         boolean durableRecord = durable;
         callbackExecutor.submit(() -> dispatchCallback(task, releasePaymentLock, durableRecord));
     }
 
-    private static void recoverPendingCallbacks() {
+    private static void recoverPersistedCallbacksOnStartup() {
         if (callbackStore == null || callbackClient == null) return;
         List<DTOs.DurableCallbackTask> pendingTasks = callbackStore.loadAll();
         if (!pendingTasks.isEmpty()) {
-            logger.info("🔁 发现 {} 条待恢复回调", pendingTasks.size());
+            logger.info("🔁 启动时发现 {} 条未完成回调，将从已记录次数继续发送", pendingTasks.size());
         }
         for (DTOs.DurableCallbackTask task : pendingTasks) {
             callbackExecutor.submit(() -> dispatchCallback(task, false, true));
-        }
-
-        if (!volatileCallbackQueue.isEmpty()) {
-            logger.warn("🔁 发现 {} 条进程内待重试回调 (磁盘持久化此前失败)", volatileCallbackQueue.size());
-        }
-        for (DTOs.DurableCallbackTask task : volatileCallbackQueue.values()) {
-            callbackExecutor.submit(() -> dispatchCallback(task, false, false));
         }
     }
 
@@ -319,19 +355,55 @@ public class Application {
             return;
         }
         try {
-            boolean delivered = callbackClient.sendCallback(taskId, task.callbackUrl(), task.payload());
-            if (delivered) {
-                if (durableRecord) {
-                    callbackStore.delete(task);
-                } else {
-                    volatileCallbackQueue.remove(recordId);
+            int maxAttempts = callbackClient.maxAttempts();
+            DTOs.DurableCallbackTask currentTask = task;
+
+            if (currentTask.nextAttemptAt() > System.currentTimeMillis()) {
+                long waitSeconds = Math.max(1L,
+                        TimeUnit.MILLISECONDS.toSeconds(currentTask.nextAttemptAt() - System.currentTimeMillis()) + 1L);
+                logger.info("[{}] 恢复待发送回调，将在约 {} 秒后继续 | recordId={} | attempts={}/{}",
+                        taskId, waitSeconds, recordId, currentTask.attemptsMade(), maxAttempts);
+                if (!callbackClient.waitUntil(taskId, currentTask.nextAttemptAt())) {
+                    return;
                 }
-                logger.info("✅ [Callback] 任务 [{}] 已确认送达 | recordId={}", taskId, recordId);
-            } else {
-                logger.error("❌ [Callback] 任务 [{}] 回调失败，已保留{}等待后续重试",
-                        taskId,
-                        durableRecord ? "持久记录" : "进程内记录");
             }
+
+            for (int attempt = Math.max(0, task.attemptsMade()) + 1; attempt <= maxAttempts; attempt++) {
+                currentTask = currentTask.withAttemptState(attempt, 0L);
+                if (!persistCallbackState(currentTask, durableRecord, "记录尝试次数")) {
+                    return;
+                }
+
+                if (callbackClient.sendAttempt(
+                        taskId,
+                        currentTask.callbackUrl(),
+                        currentTask.payload(),
+                        attempt,
+                        maxAttempts)) {
+                    completeCallback(currentTask, durableRecord);
+                    logger.info("✅ [Callback] 任务 [{}] 已确认送达 | recordId={} | attempts={}",
+                            taskId, recordId, attempt);
+                    return;
+                }
+
+                if (attempt < maxAttempts) {
+                    long retryDelayMillis = callbackClient.retryDelayMillis();
+                    long nextAttemptAt = System.currentTimeMillis() + retryDelayMillis;
+                    currentTask = currentTask.withAttemptState(attempt, nextAttemptAt);
+                    if (!persistCallbackState(currentTask, durableRecord, "记录下次重试时间")) {
+                        return;
+                    }
+                    logger.info("[{}] 回调尝试 {}/{} 失败，将在 {}ms 后重试 | recordId={}",
+                            taskId, attempt, maxAttempts, retryDelayMillis, recordId);
+                    if (!callbackClient.waitUntil(taskId, nextAttemptAt)) {
+                        logger.warn("[{}] 回调重试等待被中断，剩余次数将在下次启动时继续 | recordId={} | attempts={}/{}",
+                                taskId, recordId, attempt, maxAttempts);
+                        return;
+                    }
+                }
+            }
+
+            exhaustCallback(currentTask, durableRecord, maxAttempts);
         } finally {
             callbacksInFlight.remove(recordId);
             if (releasePaymentLock) {
@@ -341,10 +413,89 @@ public class Application {
         }
     }
 
+    private static boolean persistCallbackState(
+            DTOs.DurableCallbackTask task,
+            boolean durableRecord,
+            String action
+    ) {
+        if (!durableRecord) {
+            volatileCallbackQueue.put(task.recordId(), task);
+            return true;
+        }
+        try {
+            // 先持久化“本次机会已占用”再发送，确保进程崩溃后也不会超过总次数上限。
+            callbackStore.save(task);
+            return true;
+        } catch (Exception e) {
+            logger.error("🚨 [Callback] 无法{}，已停止发送以避免重启后重复放大 | taskId={} | recordId={} | reason={}",
+                    action, task.taskId(), task.recordId(), LogSupport.describe(e));
+            return false;
+        }
+    }
+
+    private static void completeCallback(DTOs.DurableCallbackTask task, boolean durableRecord) {
+        if (durableRecord) {
+            callbackStore.delete(task);
+        } else {
+            volatileCallbackQueue.remove(task.recordId());
+        }
+    }
+
+    private static void exhaustCallback(
+            DTOs.DurableCallbackTask task,
+            boolean durableRecord,
+            int maxAttempts
+    ) {
+        if (durableRecord) {
+            try {
+                callbackStore.markFailed(task);
+            } catch (Exception e) {
+                logger.error("❌ [Callback] 已耗尽 {} 次机会，但移入失败队列失败；记录将留在原处且不会再次发送 | taskId={} | recordId={} | reason={}",
+                        maxAttempts, task.taskId(), task.recordId(), LogSupport.describe(e));
+                return;
+            }
+        } else {
+            volatileCallbackQueue.remove(task.recordId());
+        }
+        logger.error("❌ [Callback] 已耗尽 {} 次机会，停止自动发送 | taskId={} | recordId={} | failedRecord={}",
+                maxAttempts,
+                task.taskId(),
+                task.recordId(),
+                durableRecord ? "callback_queue/failed/" + task.recordId() + ".json" : "unavailable");
+    }
+
     private static void sendJson(HttpServerExchange exchange, int statusCode, Object responseObj) {
         exchange.setStatusCode(statusCode);
         exchange.getResponseHeaders().put(Headers.CONTENT_TYPE, "application/json");
         exchange.getResponseSender().send(gson.toJson(responseObj));
+    }
+
+    private static String readRequestBody(HttpServerExchange exchange, int maxBytes) throws Exception {
+        try (InputStream input = exchange.getInputStream()) {
+            byte[] buffer = new byte[8192];
+            java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream(Math.min(maxBytes, 8192));
+            int total = 0;
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                total += read;
+                if (total > maxBytes) {
+                    sendJson(exchange, 413, new DTOs.BaseResponse("ERROR", "Request Too Large", null));
+                    throw new RequestTooLargeException();
+                }
+                output.write(buffer, 0, read);
+            }
+            return output.toString(StandardCharsets.UTF_8);
+        } catch (RequestTooLargeException e) {
+            throw e;
+        }
+    }
+
+    private static String callbackHost(String url) {
+        okhttp3.HttpUrl parsed = okhttp3.HttpUrl.parse(url);
+        return parsed == null ? "<invalid>" : parsed.host();
+    }
+
+    private static final class RequestTooLargeException extends Exception {
     }
 
     private static SSLContext createSSLContext(Path keyPath, Path certPath) throws Exception {

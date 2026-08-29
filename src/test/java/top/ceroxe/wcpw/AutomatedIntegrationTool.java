@@ -1,4 +1,4 @@
-package fun.ceroxe.wcpw;
+package top.ceroxe.wcpw;
 
 import com.google.gson.Gson;
 import com.sun.net.httpserver.HttpServer;

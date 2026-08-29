@@ -1,4 +1,4 @@
-package fun.ceroxe.wcpw;
+package top.ceroxe.wcpw;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -67,5 +67,10 @@ public class AppConfig {
     public static String get(String key) {
         String val = props.getProperty(key);
         return val == null ? null : val.trim();
+    }
+
+    public static String get(String key, String defaultValue) {
+        String val = get(key);
+        return val == null || val.isBlank() ? defaultValue : val;
     }
 }

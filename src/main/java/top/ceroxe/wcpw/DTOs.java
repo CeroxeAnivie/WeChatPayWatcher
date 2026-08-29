@@ -1,4 +1,4 @@
-package fun.ceroxe.wcpw;
+package top.ceroxe.wcpw;
 
 public class DTOs {
     public record PaymentRequest(
@@ -30,7 +30,20 @@ public class DTOs {
             String recordId,
             String taskId,
             String callbackUrl,
-            CallbackPayload payload
+            CallbackPayload payload,
+            int attemptsMade,
+            long nextAttemptAt
     ) {
+        public DurableCallbackTask(String recordId, String taskId, String callbackUrl, CallbackPayload payload) {
+            this(recordId, taskId, callbackUrl, payload, 0, 0L);
+        }
+
+        public DurableCallbackTask withAttemptsMade(int attemptsMade) {
+            return new DurableCallbackTask(recordId, taskId, callbackUrl, payload, attemptsMade, nextAttemptAt);
+        }
+
+        public DurableCallbackTask withAttemptState(int attemptsMade, long nextAttemptAt) {
+            return new DurableCallbackTask(recordId, taskId, callbackUrl, payload, attemptsMade, nextAttemptAt);
+        }
     }
 }
