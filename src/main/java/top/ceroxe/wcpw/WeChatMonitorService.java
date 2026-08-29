@@ -55,6 +55,7 @@ public class WeChatMonitorService {
             this.screenSize = Toolkit.getDefaultToolkit().getScreenSize();
             this.engine = InferenceEngine.getInstance(Model.ONNX_PPOCR_V4);
 
+            cleanupStaleOcrTempFiles();
             performWarmUp();
             initGlobalBaseline();
 
@@ -461,14 +462,34 @@ public class WeChatMonitorService {
     }
 
     private void performWarmUp() {
+        Path temp = null;
         try {
-            Path temp = Files.createTempFile("warmup_", ".png");
+            temp = Files.createTempFile("warmup_", ".png");
             BufferedImage empty = new BufferedImage(10, 10, BufferedImage.TYPE_INT_RGB);
             ImageIO.write(empty, "png", temp.toFile());
             engine.runOcr(temp.toAbsolutePath().toString());
-            deleteTempFile(temp);
         } catch (Exception ignored) {
+        } finally {
+            deleteTempFile(temp);
         }
+    }
+
+    private void cleanupStaleOcrTempFiles() {
+        Path tempDir = Path.of(System.getProperty("java.io.tmpdir"));
+        try (var paths = Files.list(tempDir)) {
+            paths.filter(Files::isRegularFile)
+                    .filter(path -> isOcrTempFile(path.getFileName().toString()))
+                    .forEach(this::deleteTempFile);
+        } catch (Exception e) {
+            logger.warn("启动时清理 OCR 临时图片失败 | reason={}", LogSupport.describe(e));
+        }
+    }
+
+    private boolean isOcrTempFile(String fileName) {
+        return fileName.endsWith(".png")
+                && (fileName.startsWith("ocr_")
+                || fileName.startsWith("scan_")
+                || fileName.startsWith("warmup_"));
     }
 
     private void printCleanLog(String taskId, int count, long cost, List<TextBlock> blocks) {
