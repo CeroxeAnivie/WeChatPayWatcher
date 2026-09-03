@@ -6,16 +6,21 @@
 
     <groupId>top.ceroxe</groupId>
     <artifactId>WeChatPayWatcher</artifactId>
-    <version>2.1.3</version>
+    <version>3.0.0</version>
 
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <slf4j.version>2.0.9</slf4j.version>
+        <slf4j.version>2.0.18</slf4j.version>
     </properties>
 
     <dependencies>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
         <!-- 1. Web 服务器 -->
         <dependency>
             <groupId>io.undertow</groupId>
@@ -35,25 +40,18 @@
             <version>1.85.2</version>
         </dependency>
 
-        <!-- 3. RapidOCR 核心包 -->
+        <!-- SQLite read-only access; supports WAL snapshots used by WeChat WCDB. -->
         <dependency>
-            <groupId>io.github.mymonstercat</groupId>
-            <artifactId>rapidocr</artifactId>
-            <version>0.0.7</version>
-        </dependency>
-        <!-- 包含默认模型 -->
-        <dependency>
-            <groupId>io.github.mymonstercat</groupId>
-            <artifactId>rapidocr-onnx-platform</artifactId>
-            <version>0.0.7</version>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.46.1.0</version>
         </dependency>
 
-        <!-- 【关键新增】强制引入 Linux 本地运行库 -->
-        <!-- 解决在 Windows 打包后上传 Linux 缺少 .so 文件的问题 -->
+        <!-- WeChat 4.x stores message_content as Zstandard-compressed XML. -->
         <dependency>
-            <groupId>io.github.mymonstercat</groupId>
-            <artifactId>rapidocr-onnx-linux-x86_64</artifactId>
-            <version>1.2.2</version>
+            <groupId>com.github.luben</groupId>
+            <artifactId>zstd-jni</artifactId>
+            <version>1.5.7-6</version>
         </dependency>
 
         <!-- 4. Gson -->
@@ -92,7 +90,7 @@
                         </goals>
                         <configuration>
                             <transformers>
-                                <!-- 【核心】合并 SPI 配置，确保 Linux 能够加载到 OCR 引擎 -->
+                                <!-- Merge JDBC/service descriptors for the shaded Linux artifact. -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
 
                                 <!-- 指定主类入口 -->
