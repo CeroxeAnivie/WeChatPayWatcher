@@ -39,7 +39,6 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -79,20 +78,15 @@ public class Application {
     public static void main(String[] args) {
         initLogging();
 
-        String currentDir = System.getProperty("user.dir");
-        File tempDir = new File(currentDir, "ocr_native_libs");
-        if (!tempDir.exists()) tempDir.mkdirs();
-        System.setProperty("java.io.tmpdir", tempDir.getAbsolutePath());
-
         Security.addProvider(new BouncyCastleProvider());
         AppConfig.init();
         securityPolicy = new SecurityPolicy();
 
         try {
-            logger.info("⚙️ 正在启动 OCR 引擎...");
+            logger.info("⚙️ 正在启动微信数据库监控...");
             monitorService = new WeChatMonitorService();
         } catch (Throwable e) {
-            logger.error("❌ OCR 引擎启动失败 | reason={}", LogSupport.describe(e));
+            logger.error("❌ 微信数据库监控启动失败 | reason={}", LogSupport.describe(e));
             System.exit(1);
         }
 
@@ -105,8 +99,6 @@ public class Application {
     private static void initLogging() {
         LoggerContext loggerContext = (LoggerContext) LoggerFactory.getILoggerFactory();
         try {
-            loggerContext.getLogger("io.github.mymonstercat").setLevel(Level.WARN);
-            loggerContext.getLogger("com.benjaminwan.ocrlibrary").setLevel(Level.WARN);
             loggerContext.getLogger("io.undertow").setLevel(Level.INFO);
             loggerContext.getLogger("org.xnio").setLevel(Level.INFO);
         } catch (Exception ignored) {
@@ -230,13 +222,14 @@ public class Application {
                         AppConfig.getInt("order.timeout.seconds", 120));
 
                 String taskId = extractOid(req.callbackUrl());
-                OptionalLong requestBaseline = monitorService.beginMonitoringTask(taskId);
-                if (requestBaseline.isEmpty()) {
+                try {
+                    monitorService.beginMonitoringTask(taskId);
+                } catch (RuntimeException e) {
                     isPending.set(false);
                     currentTaskEndTime.set(0L);
-                    logger.error("❌ [API] 未识别到微信当前的今日第 X 笔，任务未启动 | taskId={}", taskId);
+                    logger.error("❌ [API] 微信数据库监控任务未启动 | taskId={} | reason={}", taskId, LogSupport.describe(e));
                     sendJson(exchange, 503,
-                            new DTOs.BaseResponse("ERROR", "Payment Baseline Unavailable", null));
+                            new DTOs.BaseResponse("ERROR", "Payment Monitor Unavailable", null));
                     return;
                 }
 
@@ -245,8 +238,7 @@ public class Application {
                         taskId, req.money(), callbackHost(req.callbackUrl()));
 
                 try {
-                    monitorExecutor.submit(() -> runMonitorTask(
-                            taskId, req, timeoutSec, requestBaseline.getAsLong()));
+                    monitorExecutor.submit(() -> runMonitorTask(taskId, req, timeoutSec));
                 } catch (RuntimeException e) {
                     monitorService.cancelPreparedTask(taskId);
                     isPending.set(false);
@@ -286,12 +278,10 @@ public class Application {
     private static void runMonitorTask(
             String taskId,
             DTOs.PaymentRequest req,
-            int timeoutSec,
-            long requestBaseline
+            int timeoutSec
     ) {
         try {
-            boolean success = monitorService.monitorPayment(
-                    taskId, req.money(), timeoutSec, requestBaseline);
+            boolean success = monitorService.monitorPayment(taskId, req.money(), timeoutSec);
             String status = success ? "SUCCESS" : "TIMEOUT";
 
             DTOs.CallbackPayload payload = new DTOs.CallbackPayload(

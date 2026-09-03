@@ -5,6 +5,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -32,8 +34,9 @@ public class AppConfig {
             }
         }
 
-        try (InputStream in = Files.newInputStream(localConfigPath)) {
-            props.load(in);
+        try (InputStream in = Files.newInputStream(localConfigPath);
+             InputStreamReader reader = new InputStreamReader(in, StandardCharsets.UTF_8)) {
+            props.load(reader);
             validateConfig();
         } catch (IOException e) {
             throw new RuntimeException("读取配置文件失败", e);
@@ -67,6 +70,16 @@ public class AppConfig {
     public static String get(String key) {
         String val = props.getProperty(key);
         return val == null ? null : val.trim();
+    }
+
+    public static long getLong(String key, long defaultValue) {
+        String val = props.getProperty(key);
+        if (val == null || val.isBlank()) return defaultValue;
+        try {
+            return Long.parseLong(val.trim());
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
     }
 
     public static String get(String key, String defaultValue) {
