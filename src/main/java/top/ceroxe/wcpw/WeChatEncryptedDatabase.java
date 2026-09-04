@@ -116,28 +116,48 @@ final class WeChatEncryptedDatabase {
         if (!Files.isRegularFile(wal) || Files.size(wal) < 32 + 24 + PAGE_SIZE) return;
         try (FileChannel input = FileChannel.open(wal, StandardOpenOption.READ)) {
             ByteBuffer header = ByteBuffer.allocate(32);
-            readFully(input, header);
+            if (!readFully(input, header)) return;
             header.flip();
+            int magic = header.getInt(0);
+            if (magic != 0x377f0682 && magic != 0x377f0683) return;
             int pageSize = header.getInt(8);
             if (pageSize != PAGE_SIZE) return;
+            int salt1 = header.getInt(16);
+            int salt2 = header.getInt(20);
             long frameSize = 24L + PAGE_SIZE;
             ByteBuffer frameHeader = ByteBuffer.allocate(24);
             ByteBuffer encryptedPage = ByteBuffer.allocate(PAGE_SIZE);
+            java.util.List<WalFrame> transaction = new java.util.ArrayList<>();
+            java.util.List<WalFrame> committed = new java.util.ArrayList<>();
+            long committedPageCount = 0;
             while (input.position() + frameSize <= input.size()) {
                 frameHeader.clear();
                 if (!readFully(input, frameHeader)) break;
                 frameHeader.flip();
                 long pageNumber = Integer.toUnsignedLong(frameHeader.getInt());
+                long databasePageCount = Integer.toUnsignedLong(frameHeader.getInt());
+                int frameSalt1 = frameHeader.getInt();
+                int frameSalt2 = frameHeader.getInt();
                 encryptedPage.clear();
-                if (!readFully(input, encryptedPage) || pageNumber == 0 || pageNumber > 1_000_000) break;
+                if (!readFully(input, encryptedPage) || pageNumber == 0 || pageNumber > 1_000_000
+                        || frameSalt1 != salt1 || frameSalt2 != salt2) break;
                 encryptedPage.flip();
                 byte[] raw = new byte[PAGE_SIZE];
                 encryptedPage.get(raw);
-                byte[] clear = decryptPage(raw, key, (int) pageNumber);
+                transaction.add(new WalFrame(pageNumber, raw));
+                if (databasePageCount > 0) {
+                    committed.addAll(transaction);
+                    transaction.clear();
+                    committedPageCount = databasePageCount;
+                }
+            }
+            for (WalFrame frame : committed) {
+                byte[] clear = decryptPage(frame.encryptedPage(), key, (int) frame.pageNumber());
                 ByteBuffer page = ByteBuffer.wrap(clear);
-                output.position((pageNumber - 1) * (long) PAGE_SIZE);
+                output.position((frame.pageNumber() - 1) * (long) PAGE_SIZE);
                 while (page.hasRemaining()) output.write(page);
             }
+            if (committedPageCount > 0) output.truncate(committedPageCount * PAGE_SIZE);
         }
     }
 
@@ -229,4 +249,6 @@ final class WeChatEncryptedDatabase {
                     .toList();
         }
     }
+
+    private record WalFrame(long pageNumber, byte[] encryptedPage) { }
 }

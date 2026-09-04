@@ -5,7 +5,9 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.encoder.PatternLayoutEncoder;
 import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.FileAppender;
+import ch.qos.logback.core.rolling.RollingFileAppender;
+import ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy;
+import ch.qos.logback.core.util.FileSize;
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 import io.undertow.Undertow;
@@ -34,8 +36,6 @@ import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.Security;
 import java.security.cert.Certificate;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -76,10 +76,9 @@ public class Application {
     private static SecurityPolicy securityPolicy;
 
     public static void main(String[] args) {
-        initLogging();
-
         Security.addProvider(new BouncyCastleProvider());
         AppConfig.init();
+        initLogging();
         securityPolicy = new SecurityPolicy();
 
         try {
@@ -101,30 +100,36 @@ public class Application {
         try {
             loggerContext.getLogger("io.undertow").setLevel(Level.INFO);
             loggerContext.getLogger("org.xnio").setLevel(Level.INFO);
+            loggerContext.getLogger(Logger.ROOT_LOGGER_NAME).setLevel(Level.INFO);
         } catch (Exception ignored) {
         }
 
         try {
             File logDir = new File("logs");
             if (!logDir.exists()) logDir.mkdirs();
-            String timeStr = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss").format(LocalDateTime.now());
-            String logFilePath = "logs" + File.separator + "log_" + timeStr + ".log";
-
             PatternLayoutEncoder encoder = new PatternLayoutEncoder();
             encoder.setContext(loggerContext);
             encoder.setPattern("%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n");
             encoder.start();
 
-            FileAppender<ILoggingEvent> fileAppender = new FileAppender<>();
+            RollingFileAppender<ILoggingEvent> fileAppender = new RollingFileAppender<>();
             fileAppender.setContext(loggerContext);
             fileAppender.setName("FILE_APPENDER");
-            fileAppender.setFile(logFilePath);
+            fileAppender.setFile("logs" + File.separator + "wcpw.log");
             fileAppender.setEncoder(encoder);
+            SizeAndTimeBasedRollingPolicy<ILoggingEvent> policy = new SizeAndTimeBasedRollingPolicy<>();
+            policy.setContext(loggerContext);
+            policy.setParent(fileAppender);
+            policy.setFileNamePattern("logs" + File.separator + "archive" + File.separator + "wcpw-%d{yyyy-MM-dd}.%i.log");
+            policy.setMaxFileSize(FileSize.valueOf(AppConfig.getInt("logging.max.file.mb", 20) + "MB"));
+            policy.setMaxHistory(AppConfig.getInt("logging.max.history.days", 7));
+            policy.setTotalSizeCap(FileSize.valueOf(AppConfig.getInt("logging.total.size.mb", 200) + "MB"));
+            policy.start();
+            fileAppender.setRollingPolicy(policy);
             fileAppender.start();
 
-            Logger rootLogger = loggerContext.getLogger(Logger.ROOT_LOGGER_NAME);
-            rootLogger.addAppender(fileAppender);
-            System.out.println("📄 日志文件已创建: " + logFilePath);
+            loggerContext.getLogger(Logger.ROOT_LOGGER_NAME).addAppender(fileAppender);
+            System.out.println("📄 日志滚动文件已启用: logs" + File.separator + "wcpw.log");
         } catch (Exception e) {
             System.err.println("❌ 初始化日志文件失败: " + e.getMessage());
         }

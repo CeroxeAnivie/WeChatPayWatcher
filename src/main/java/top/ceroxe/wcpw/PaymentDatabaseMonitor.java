@@ -82,7 +82,7 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
              Statement statement = connection.createStatement();
              ResultSet result = statement.executeQuery(
                      "SELECT 1 FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%' "
-                             + "AND sql LIKE '%message_content%' LIMIT 1")) {
+                             + "AND (sql LIKE '%message_content%' OR sql LIKE '%compress_content%') LIMIT 1")) {
             return result.next();
         } catch (SQLException | RuntimeException ignored) {
             return false;
@@ -101,6 +101,9 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
         } catch (SQLException e) {
             resetAutomaticPath();
             throw databaseException(e);
+        } catch (RuntimeException e) {
+            resetAutomaticPath();
+            throw e;
         }
     }
 
@@ -142,6 +145,7 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
             for (Row row : readRows(connection)) {
                 String previous = liveFingerprints.put(row.key(), row.fingerprint());
                 if (Objects.equals(previous, row.fingerprint())) continue;
+                logger.info("检测到微信消息行变化 | key={} | 新增={} ", row.key(), previous == null);
                 PaymentEvent event = parsePayment(row);
                 if (event != null) return Optional.of(new Change(event));
             }
@@ -200,7 +204,7 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
     }
 
     private PaymentEvent parsePayment(Row row) {
-        String content = textValue(row.values().get("message_content"));
+        String content = messageContent(row.values());
         if (content == null || !RECEIPT_MARKER.matcher(content).find()) {
             logger.debug("忽略非收款消息 | key={}", row.key());
             return null;
@@ -231,7 +235,7 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
         try (Statement statement = connection.createStatement();
              ResultSet result = statement.executeQuery(
                      "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%' "
-                             + "AND sql LIKE '%message_content%' ORDER BY name")) {
+                             + "AND (sql LIKE '%message_content%' OR sql LIKE '%compress_content%') ORDER BY name")) {
             while (result.next()) tables.add(result.getString(1));
         }
         if (tables.isEmpty()) throw new SQLException("微信收款消息库尚未生成动态 Msg_* 表");
@@ -262,6 +266,14 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
             }
         }
         return value.toString();
+    }
+
+    private static String messageContent(Map<String, Object> values) {
+        String content = textValue(values.get("message_content"));
+        if (content != null && !content.isBlank()) return content;
+        content = textValue(values.get("compress_content"));
+        if (content != null && !content.isBlank()) return content;
+        return textValue(values.get("packed_info_data"));
     }
 
     private Path refreshDecryptedSnapshot() {

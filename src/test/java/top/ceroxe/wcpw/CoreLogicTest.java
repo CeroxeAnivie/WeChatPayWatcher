@@ -41,6 +41,21 @@ public class CoreLogicTest {
         } finally { Files.deleteIfExists(db); }
     }
 
+    public void testCompressedContentColumnIsAcceptedWhenPrimaryContentIsEmpty() throws Exception {
+        Path db = Files.createTempFile("wcpw-compressed-content-", ".db");
+        try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + db);
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE Msg_fixture (local_id INTEGER PRIMARY KEY, create_time INTEGER, message_content TEXT, compress_content TEXT)");
+            statement.execute("INSERT INTO Msg_fixture VALUES (1,200,'','" + sql(receipt("4.50", "TX_COMPRESSED", 200)) + "')");
+            try (PaymentDatabaseMonitor monitor = monitor(db)) {
+                monitor.validate();
+                statement.execute("UPDATE Msg_fixture SET compress_content=compress_content || ' '");
+                PaymentDatabaseMonitor.PaymentEvent event = monitor.findNewChange().orElseThrow().event();
+                assertEquals("4.50", event.amount().toPlainString(), "message_content 为空时应读取 compress_content");
+            }
+        } finally { Files.deleteIfExists(db); }
+    }
+
     public void testMismatchedReceiptIsConsumedOnce() throws Exception {
         Path db = fixture("历史消息", 1);
         try (PaymentDatabaseMonitor monitor = monitor(db)) {

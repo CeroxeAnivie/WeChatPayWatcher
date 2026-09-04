@@ -90,7 +90,6 @@ public final class WeChatMonitorService {
         try {
             if (activeTaskCount.get() == 0) {
                 databaseMonitor.observeNewRows();
-                logger.debug("数据库新事件高水位检查完成");
             }
         } catch (RuntimeException e) {
             logger.warn("数据库例行检查失败 | reason={}", LogSupport.describe(e));

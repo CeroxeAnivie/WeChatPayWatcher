@@ -1,6 +1,6 @@
 # WeChat Payment Watcher
 
-WCPW 是 Debian 上运行的微信支付数据库监控服务。它读取 WeChat Linux 当前进程实际打开的 WCDB/SQLite 收款消息库，从动态 `Msg_*` 表的 `message_content` 识别收款通知。
+WCPW 是 Debian 上运行的微信支付数据库监控服务。它读取 WeChat Linux 当前进程实际打开的 WCDB/SQLite 收款消息库，从动态 `Msg_*` 表的 `message_content`/`compress_content` 识别收款通知。
 
 ## 工作方式
 
@@ -47,3 +47,9 @@ wechat.db.poll.interval.ms=1000
 ```
 
 测试使用临时 SQLite 数据库，覆盖历史消息忽略、新收款识别、金额精确匹配、变化去重和非收款过滤。
+
+隔离检测（不启动 HTTP、请求或回调）可直接运行：
+
+```bash
+java -cp WeChatPayWatcher-3.0.0.jar top.ceroxe.wcpw.DatabaseMonitorIsolation --timeout-seconds 900
+```
