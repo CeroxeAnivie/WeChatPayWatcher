@@ -50,11 +50,6 @@ final class WeChatDatabaseLocator {
         throw new IllegalStateException("暂未找到微信收款消息库；等待微信登录并产生收款消息");
     }
 
-    static boolean isMessageStore(Path path) {
-        String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
-        return name.startsWith("biz_message") || name.startsWith("message_");
-    }
-
     private static boolean encryptedHasMessageTables(Path database) {
         OptionalLong pid = findProcessId(database);
         if (pid.isEmpty()) return false;
