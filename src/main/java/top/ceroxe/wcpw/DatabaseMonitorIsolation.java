@@ -10,7 +10,7 @@ import java.util.Optional;
 
 /**
  * 独立数据库检测入口：不启动 HTTP、订单、鉴权或回调，只验证微信收款消息检测链路。
- * 可通过 `java -cp WeChatPayWatcher-3.0.0.jar top.ceroxe.wcpw.DatabaseMonitorIsolation` 运行。
+ * 可通过 `java -cp WeChatPayWatcher-3.0.1.jar top.ceroxe.wcpw.DatabaseMonitorIsolation` 运行。
  */
 public final class DatabaseMonitorIsolation {
     private static final Logger logger = LoggerFactory.getLogger(DatabaseMonitorIsolation.class);

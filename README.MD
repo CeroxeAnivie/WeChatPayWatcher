@@ -13,7 +13,7 @@ WCPW 是 Debian 上运行的微信支付数据库监控服务。它读取 WeChat
 需要 JDK 21。先保持 WeChat Linux 登录并运行，再启动服务：
 
 ```bash
-java -jar WeChatPayWatcher-3.0.0.jar
+java -jar WeChatPayWatcher-3.0.1.jar
 ```
 
 首次启动会生成 `config.properties`。至少设置：
@@ -51,5 +51,5 @@ wechat.db.poll.interval.ms=1000
 隔离检测（不启动 HTTP、请求或回调）可直接运行：
 
 ```bash
-java -cp WeChatPayWatcher-3.0.0.jar top.ceroxe.wcpw.DatabaseMonitorIsolation --timeout-seconds 900
+java -cp WeChatPayWatcher-3.0.1.jar top.ceroxe.wcpw.DatabaseMonitorIsolation --timeout-seconds 900
 ```

@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.security.MessageDigest;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -49,6 +50,7 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
     private volatile boolean encrypted;
     private volatile byte[] encryptionKey;
     private volatile Path decryptedSnapshot;
+    private volatile SourceSignature decryptedSignature;
     private volatile boolean liveInitialized;
     private volatile boolean captureFirstDatabaseForTask;
 
@@ -62,6 +64,7 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
         this.automaticPath = databasePath == null;
         this.databasePath = databasePath == null ? null : databasePath.toAbsolutePath().normalize();
         this.queryLimit = Math.max(1, Math.min(queryLimit, 2000));
+        cleanupLegacySnapshots();
     }
 
     static boolean looksEncrypted(Path path) {
@@ -284,14 +287,49 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
             logger.info("已从微信进程提取数据库会话密钥 | pid={} | file={}", pid.getAsLong(), databasePath);
         }
         try {
-            Path next = Files.createTempFile("wcpw-wechat-decrypted-", ".db");
+            SourceSignature current = SourceSignature.read(databasePath);
+            if (decryptedSnapshot != null && current.equals(decryptedSignature)
+                    && Files.isRegularFile(decryptedSnapshot)) return decryptedSnapshot;
+
+            Path tempDirectory = Paths.get(System.getProperty("java.io.tmpdir", "/tmp"));
+            String stableName = "wcpw-wechat-decrypted-" + stableFileId(databasePath) + ".db";
+            Path target = tempDirectory.resolve(stableName);
+            Path next = tempDirectory.resolve(stableName + ".next");
             WeChatEncryptedDatabase.decrypt(databasePath, next, encryptionKey);
-            Path old = decryptedSnapshot;
-            decryptedSnapshot = next;
-            if (old != null) Files.deleteIfExists(old);
-            return next;
+            try {
+                Files.move(next, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                Files.move(next, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            decryptedSnapshot = target;
+            decryptedSignature = current;
+            logger.debug("微信数据库源已变化，已刷新解密快照 | file={}", target);
+            return target;
         } catch (IOException e) {
             throw new IllegalStateException("创建微信数据库解密快照失败", e);
+        }
+    }
+
+    private static String stableFileId(Path path) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(path.toAbsolutePath().normalize().toString().getBytes(StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest, 0, 12);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return Integer.toHexString(path.toString().hashCode());
+        }
+    }
+
+    private static void cleanupLegacySnapshots() {
+        Path tempDirectory = Paths.get(System.getProperty("java.io.tmpdir", "/tmp"));
+        try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(tempDirectory, "wcpw-wechat-decrypted-*.db")) {
+            for (Path entry : entries) {
+                try { Files.deleteIfExists(entry); }
+                catch (IOException e) { logger.debug("清理历史解密快照失败 | file={}", entry); }
+            }
+        } catch (IOException e) {
+            logger.debug("扫描历史解密快照失败 | reason={}", e.getMessage());
         }
     }
 
@@ -318,6 +356,7 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
             try { Files.deleteIfExists(decryptedSnapshot); } catch (IOException ignored) { }
             decryptedSnapshot = null;
         }
+        decryptedSignature = null;
         if (encryptionKey != null) java.util.Arrays.fill(encryptionKey, (byte) 0);
         encryptionKey = null;
         liveFingerprints.clear();
@@ -340,6 +379,15 @@ public final class PaymentDatabaseMonitor implements AutoCloseable {
     }
 
     private record Row(String key, String fingerprint, Map<String, Object> values) { }
+    private record SourceSignature(long databaseSize, long databaseModified,
+                                   long walSize, long walModified) {
+        static SourceSignature read(Path database) throws IOException {
+            Path wal = database.resolveSibling(database.getFileName() + "-wal");
+            return new SourceSignature(Files.size(database), Files.getLastModifiedTime(database).toMillis(),
+                    Files.isRegularFile(wal) ? Files.size(wal) : 0L,
+                    Files.isRegularFile(wal) ? Files.getLastModifiedTime(wal).toMillis() : 0L);
+        }
+    }
     public record Change(PaymentEvent event) { }
     public record PaymentEvent(String transactionId, BigDecimal amount, String paidAt) { }
     public static final class DatabaseBusyException extends IllegalStateException {
